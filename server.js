@@ -1,6 +1,9 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const db = require('./database');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -26,7 +29,7 @@ const notifyAdmins = (ticketId, type, message) => {
 app.post('/api/login', (req, res) => {
     const { username, password } = req.body;
     db.get(`
-        SELECT u.id, u.username, u.name, u.role, u.company_id, c.corporate_name as company_name 
+        SELECT u.id, u.username, u.name, u.role, u.company_id, c.name as company_name 
         FROM users u 
         LEFT JOIN companies c ON u.company_id = c.id
         WHERE u.username = ? AND u.password_hash = ? AND u.active = 1
@@ -63,18 +66,44 @@ app.put('/api/notifications/:id/read', (req, res) => {
 
 // --- Companies Routes ---
 app.get('/api/companies', (req, res) => {
-    db.all('SELECT * FROM companies ORDER BY corporate_name', [], (err, rows) => {
+    db.all('SELECT * FROM companies ORDER BY name', [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
     });
 });
 
 app.post('/api/companies', (req, res) => {
-    const { corporate_name, trade_name, cnpj, main_contact_name, main_contact_email, phone, status } = req.body;
-    const query = `INSERT INTO companies (corporate_name, trade_name, cnpj, main_contact_name, main_contact_email, phone, status) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-    db.run(query, [corporate_name, trade_name, cnpj, main_contact_name, main_contact_email, phone, status || 'Active'], function(err) {
+    const { name, trade_name, cnpj, contact_name, contact_email, phone, status } = req.body;
+    const query = `INSERT INTO companies (name, trade_name, cnpj, contact_name, contact_email, phone, status) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+    db.run(query, [name, trade_name, cnpj, contact_name, contact_email, phone, status || 'Active'], function(err) {
         if (err) return res.status(500).json({ error: err.message });
         res.status(201).json({ id: this.lastID });
+    });
+});
+
+app.put('/api/companies/:id', (req, res) => {
+    const { name, trade_name, cnpj, contact_name, contact_email, phone, status } = req.body;
+
+    db.get('SELECT * FROM companies WHERE id = ?', [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: 'Cliente não encontrado.' });
+
+        const updatedName           = name          !== undefined ? name          : row.name;
+        const updatedTradeName      = trade_name    !== undefined ? trade_name    : row.trade_name;
+        const updatedCnpj           = cnpj          !== undefined ? cnpj          : row.cnpj;
+        const updatedContact        = contact_name  !== undefined ? contact_name  : row.contact_name;
+        const updatedContactEmail   = contact_email !== undefined ? contact_email : row.contact_email;
+        const updatedPhone          = phone         !== undefined ? phone         : row.phone;
+        const updatedStatus         = status        !== undefined ? status        : row.status;
+
+        db.run(
+            `UPDATE companies SET name=?, trade_name=?, cnpj=?, contact_name=?, contact_email=?, phone=?, status=? WHERE id=?`,
+            [updatedName, updatedTradeName, updatedCnpj, updatedContact, updatedContactEmail, updatedPhone, updatedStatus, req.params.id],
+            function(updateErr) {
+                if (updateErr) return res.status(500).json({ error: updateErr.message });
+                res.json({ success: true });
+            }
+        );
     });
 });
 
@@ -82,7 +111,7 @@ app.post('/api/companies', (req, res) => {
 app.get('/api/users', (req, res) => {
     const { companyId } = req.query;
     let query = `
-        SELECT u.id, u.name, u.username, u.email, u.role, u.active, u.company_id, c.corporate_name as company_name 
+        SELECT u.id, u.name, u.username, u.email, u.role, u.active, u.company_id, u.department, c.name as company_name 
         FROM users u 
         LEFT JOIN companies c ON u.company_id = c.id
     `;
@@ -100,13 +129,55 @@ app.get('/api/users', (req, res) => {
 });
 
 app.post('/api/users', (req, res) => {
-    const { company_id, name, email, username, password_hash, role } = req.body;
+    const { company_id, name, email, username, password_hash, role, department } = req.body;
     const normalizedRole = role ? role.toLowerCase() : 'cliente_usuario';
-    const query = `INSERT INTO users (company_id, name, email, username, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)`;
-    db.run(query, [company_id, name, email, username, password_hash, normalizedRole], function(err) {
+    const query = `INSERT INTO users (company_id, name, email, username, password_hash, role, department) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+    db.run(query, [company_id, name, email, username, password_hash, normalizedRole, department || null], function(err) {
         if (err) return res.status(500).json({ error: err.message });
         res.status(201).json({ id: this.lastID });
     });
+});
+
+app.put('/api/users/:id', (req, res) => {
+    const { name, email, username, role, company_id, active, department } = req.body;
+    db.get('SELECT * FROM users WHERE id = ?', [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: 'User not found' });
+
+        const updatedName       = name       !== undefined ? name       : row.name;
+        const updatedEmail      = email      !== undefined ? email      : row.email;
+        const updatedUsername   = username   !== undefined ? username   : row.username;
+        const updatedRole       = role       !== undefined ? role.toLowerCase() : row.role;
+        const updatedCompany    = company_id !== undefined ? company_id : row.company_id;
+        const updatedActive     = active     !== undefined ? active     : row.active;
+        const updatedDepartment = department !== undefined ? department : row.department;
+
+        db.run(
+            `UPDATE users SET name=?, email=?, username=?, role=?, company_id=?, active=?, department=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+            [updatedName, updatedEmail, updatedUsername, updatedRole, updatedCompany, updatedActive, updatedDepartment, req.params.id],
+            function(err) {
+                if (err) return res.status(500).json({ error: err.message });
+                res.json({ message: 'User updated successfully' });
+            }
+        );
+    });
+});
+
+app.put('/api/users/:id/password', (req, res) => {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'Password is required' });
+
+    // TODO: Implement bcrypt for password hashing
+    const passwordHash = password;
+
+    db.run(
+        `UPDATE users SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+        [passwordHash, req.params.id],
+        function(err) {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ success: true, message: 'Password updated successfully' });
+        }
+    );
 });
 
 
@@ -116,8 +187,9 @@ app.get('/api/tickets', (req, res) => {
     
     let query = `
         SELECT t.*, 
-            c.corporate_name as company_name, 
+            c.name as company_name, 
             u.name as opened_by_name,
+            u.department as opener_department,
             tech.name as technician_name
         FROM tickets t
         JOIN companies c ON t.company_id = c.id
@@ -161,8 +233,9 @@ app.get('/api/tickets/:id', (req, res) => {
     const { userId, companyId, role } = req.query;
     const query = `
         SELECT t.*, 
-            c.corporate_name as company_name, 
+            c.name as company_name, 
             u.name as opened_by_name,
+            u.department as opener_department,
             tech.name as technician_name
         FROM tickets t
         JOIN companies c ON t.company_id = c.id
@@ -355,6 +428,102 @@ setInterval(() => {
         }
     });
 }, 30000); // Every 30 seconds
+
+// --- Password Reset Routes ---
+
+const mailer = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    secure: false,
+    auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+    },
+});
+
+const sendResetEmail = async (toEmail, resetLink) => {
+    await mailer.sendMail({
+        from: process.env.SMTP_FROM || '"Goldtech Helpdesk" <suporte@goldtech.com.br>',
+        to: toEmail,
+        subject: 'Redefinição de senha — Goldtech Helpdesk',
+        html: `
+            <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;background:#0f1117;color:#fff;border-radius:16px">
+                <h2 style="color:#d4af37;margin-top:0">Goldtech Helpdesk</h2>
+                <p style="color:#94a3b8">Recebemos uma solicitação para redefinir sua senha.</p>
+                <p style="color:#94a3b8">Clique no botão abaixo para criar uma nova senha. O link expira em <strong style="color:#fff">1 hora</strong>.</p>
+                <a href="${resetLink}" style="display:inline-block;margin:24px 0;padding:14px 28px;background:#d4af37;color:#000;font-weight:700;border-radius:10px;text-decoration:none">Redefinir senha</a>
+                <p style="color:#64748b;font-size:0.8rem">Se você não solicitou a redefinição, ignore este e-mail.</p>
+                <p style="color:#64748b;font-size:0.8rem;margin-top:32px">© ${new Date().getFullYear()} Goldtech Soluções em Tecnologia</p>
+            </div>
+        `,
+    });
+};
+
+app.post('/api/auth/forgot-password', (req, res) => {
+    const { email } = req.body;
+    const SAFE_MSG = 'Se o e-mail estiver cadastrado, enviaremos as instruções de recuperação.';
+
+    if (!email) return res.status(400).json({ error: 'E-mail obrigatório.' });
+
+    db.get('SELECT id, email FROM users WHERE email = ? AND active = 1', [email], async (err, user) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        // Always respond with same message for security
+        if (!user) return res.json({ message: SAFE_MSG });
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
+
+        db.run(
+            'UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE id = ?',
+            [token, expires, user.id],
+            async (updateErr) => {
+                if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+                const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+                const resetLink = `${frontendUrl}/reset-password?token=${token}`;
+
+                try {
+                    await sendResetEmail(user.email, resetLink);
+                } catch (mailErr) {
+                    console.error('Erro ao enviar e-mail:', mailErr.message);
+                    // Still respond OK so token is generated even if SMTP isn't configured
+                }
+
+                res.json({ message: SAFE_MSG });
+            }
+        );
+    });
+});
+
+app.post('/api/auth/reset-password', (req, res) => {
+    const { token, password } = req.body;
+    if (!token || !password) return res.status(400).json({ error: 'Token e nova senha são obrigatórios.' });
+
+    db.get(
+        'SELECT id, reset_token_expires FROM users WHERE reset_token = ?',
+        [token],
+        (err, user) => {
+            if (err) return res.status(500).json({ error: err.message });
+            if (!user) return res.status(400).json({ error: 'Token inválido ou expirado.' });
+
+            const now = new Date();
+            const expires = new Date(user.reset_token_expires);
+            if (now > expires) return res.status(400).json({ error: 'Token expirado. Solicite uma nova redefinição.' });
+
+            // TODO: implementar bcrypt quando o sistema migrar para hash seguro
+            // Ex: const hash = await bcrypt.hash(password, 10);
+            db.run(
+                'UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expires = NULL WHERE id = ?',
+                [password, user.id],
+                (updateErr) => {
+                    if (updateErr) return res.status(500).json({ error: updateErr.message });
+                    res.json({ message: 'Senha redefinida com sucesso.' });
+                }
+            );
+        }
+    );
+});
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);

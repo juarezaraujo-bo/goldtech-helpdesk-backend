@@ -12,11 +12,11 @@ const db = new sqlite3.Database(dbPath, (err) => {
             // Create tables
             db.run(`CREATE TABLE IF NOT EXISTS companies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                corporate_name TEXT NOT NULL,
+                name TEXT NOT NULL,
                 trade_name TEXT,
                 cnpj TEXT UNIQUE,
-                main_contact_name TEXT,
-                main_contact_email TEXT,
+                contact_name TEXT,
+                contact_email TEXT,
                 phone TEXT,
                 status TEXT DEFAULT 'Active',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -31,9 +31,27 @@ const db = new sqlite3.Database(dbPath, (err) => {
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL, -- 'admin_goldtech', 'tecnico', 'cliente_gestor', 'cliente_usuario'
                 active INTEGER DEFAULT 1,
+                department TEXT,
+                reset_token TEXT,
+                reset_token_expires DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(company_id) REFERENCES companies(id)
             )`);
+
+            // Safe migration: add department column if it doesn't exist
+            db.run(`ALTER TABLE users ADD COLUMN department TEXT`, (err) => {
+                // Ignore error if column already exists
+            });
+
+            // Safe migration: add updated_at column
+            db.run(`ALTER TABLE users ADD COLUMN updated_at DATETIME`, (err) => {
+                if (err) console.error("Migration error updated_at:", err.message);
+            });
+
+            // Safe migrations for password reset
+            db.run(`ALTER TABLE users ADD COLUMN reset_token TEXT`, () => {});
+            db.run(`ALTER TABLE users ADD COLUMN reset_token_expires DATETIME`, () => {});
 
             db.run(`CREATE TABLE IF NOT EXISTS tickets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,11 +104,11 @@ const db = new sqlite3.Database(dbPath, (err) => {
                     console.log('Seeding initial data...');
                     
                     // Seed Companies
-                    db.run(`INSERT INTO companies (corporate_name, trade_name, cnpj) VALUES (?, ?, ?)`, 
+                    db.run(`INSERT INTO companies (name, trade_name, cnpj) VALUES (?, ?, ?)`, 
                         ['Goldtech Soluções', 'Goldtech', '00000000000000']);
-                    db.run(`INSERT INTO companies (corporate_name, trade_name, cnpj) VALUES (?, ?, ?)`, 
+                    db.run(`INSERT INTO companies (name, trade_name, cnpj) VALUES (?, ?, ?)`, 
                         ['Cliente Alpha Ltda', 'Alpha Corp', '11111111111111']);
-                    db.run(`INSERT INTO companies (corporate_name, trade_name, cnpj) VALUES (?, ?, ?)`, 
+                    db.run(`INSERT INTO companies (name, trade_name, cnpj) VALUES (?, ?, ?)`, 
                         ['Cliente Beta S.A.', 'Beta Solutions', '22222222222222']);
 
                     // Seed Users
