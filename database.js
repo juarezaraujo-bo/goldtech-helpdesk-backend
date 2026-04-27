@@ -98,6 +98,35 @@ const db = new sqlite3.Database(dbPath, (err) => {
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )`);
 
+            db.run(`CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE NOT NULL,
+                step TEXT NOT NULL,
+                data TEXT, -- JSON para armazenar dados parciais do atendimento
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+
+            // Safe migration: add whatsapp columns to tickets
+            db.run(`ALTER TABLE tickets ADD COLUMN origin TEXT DEFAULT 'web'`, () => {});
+            db.run(`ALTER TABLE tickets ADD COLUMN whatsapp_number TEXT`, () => {});
+
+            // Ensure Generic WhatsApp Company and User exists for foreign key references
+            db.get("SELECT id FROM companies WHERE name = 'Clientes WhatsApp'", (err, row) => {
+                if (!row) {
+                    db.run(`INSERT INTO companies (name, trade_name, cnpj) VALUES (?, ?, ?)`, ['Clientes WhatsApp', 'WhatsApp', '99999999999999'], function(err) {
+                        if (!err) {
+                            const companyId = this.lastID;
+                            db.run(`INSERT INTO users (company_id, name, email, username, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)`,
+                            [companyId, 'Contato WhatsApp', 'whatsapp@system.local', 'whatsapp_user', 'no_login_needed', 'cliente_usuario']);
+                        } else {
+                            console.error("Migration error company WhatsApp:", err.message);
+                        }
+                    });
+                }
+            });
+
+
             // Seed initial data
             db.get("SELECT count(*) as count FROM companies", (err, row) => {
                 if (row && row.count === 0) {

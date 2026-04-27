@@ -525,6 +525,10 @@ app.post('/api/auth/reset-password', (req, res) => {
     );
 });
 
+// --- WhatsApp Integration ---
+const whatsappRoutes = require('./src/routes/whatsappRoutes');
+app.use('/api/whatsapp', whatsappRoutes);
+
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
 });
