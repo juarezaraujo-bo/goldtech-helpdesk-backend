@@ -11,6 +11,14 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+app.get('/', (req, res) => {
+    res.json({ status: 'ok', service: 'goldtech-helpdesk-api' });
+});
+
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', service: 'goldtech-helpdesk-api' });
+});
+
 // --- Notification Helper ---
 const createNotification = (userId, ticketId, type, message) => {
     const query = `INSERT INTO notifications (user_id, ticket_id, type, message) VALUES (?, ?, ?, ?)`;
