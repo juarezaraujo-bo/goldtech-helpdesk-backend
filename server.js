@@ -269,7 +269,30 @@ app.get('/api/tickets/:id', (req, res) => {
 });
 
 app.post('/api/tickets', (req, res) => {
-    const { title, description, category, priority, company_id, opened_by_user_id, assigned_technician_id } = req.body;
+    const integrationSource = req.body.source;
+    const isIntegrationTicket = Boolean(integrationSource);
+
+    if (isIntegrationTicket) {
+        const expectedToken = process.env.HELPDESK_API_TOKEN;
+        const receivedToken = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+
+        if (expectedToken && receivedToken !== expectedToken) {
+            return res.status(401).json({ error: 'Invalid integration token' });
+        }
+    }
+
+    const title = req.body.title;
+    const description = req.body.description;
+    const category = req.body.category;
+    const assigned_technician_id = req.body.assigned_technician_id;
+    const company_id = req.body.company_id || req.body.client_id;
+    const opened_by_user_id = req.body.opened_by_user_id || Number(process.env.HELPDESK_SYSTEM_USER_ID || 1);
+    const priorityMap = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
+    const priority = priorityMap[String(req.body.priority || 'Medium').toLowerCase()] || req.body.priority || 'Medium';
+
+    if (!title || !company_id || !opened_by_user_id) {
+        return res.status(400).json({ error: 'title, company_id and opened_by_user_id are required' });
+    }
     
     db.get("SELECT COUNT(*) as count FROM tickets", (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
