@@ -1,15 +1,18 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const db = require('./database');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
+function createApp(db, authOptions = {}) {
 const app = express();
-const PORT = process.env.PORT || 5000;
+const databaseError = (res, error) => {
+    console.error('Helpdesk database operation failed', { code: error.code || 'DATABASE_ERROR' });
+    return res.status(500).json({ error: 'Não foi possível processar a solicitação.' });
+};
 
-app.use(cors());
 app.use(express.json());
+require('./services/helpdesk-auth').installHelpdeskAuth(app, db, authOptions);
+require('./routes/visit-catalogs')(app, db);
+require('./routes/visits')(app, db);
 
 app.get('/', (req, res) => {
     res.json({ status: 'ok', service: 'goldtech-helpdesk-api' });
@@ -33,49 +36,35 @@ const notifyAdmins = (ticketId, type, message) => {
     });
 };
 
-// --- Authentication Route ---
-app.post('/api/login', (req, res) => {
-    const { username, password } = req.body;
-    db.get(`
-        SELECT u.id, u.username, u.name, u.role, u.company_id, c.name as company_name 
-        FROM users u 
-        LEFT JOIN companies c ON u.company_id = c.id
-        WHERE u.username = ? AND u.password_hash = ? AND u.active = 1
-    `, [username, password], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (row) {
-            res.json({ user: row });
-        } else {
-            res.status(401).json({ error: 'Invalid credentials or inactive user' });
-        }
-    });
-});
+// Login and session endpoints are registered centrally by helpdesk-auth.
 
 // --- Notifications Endpoints ---
 app.get('/api/notifications', (req, res) => {
-    const { userId } = req.query;
+    const userId = req.user.id;
     db.all(`
         SELECT * FROM notifications 
         WHERE user_id = ? 
         ORDER BY created_at DESC 
         LIMIT 50
     `, [userId], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         res.json(rows);
     });
 });
 
 app.put('/api/notifications/:id/read', (req, res) => {
-    db.run("UPDATE notifications SET read = 1 WHERE id = ?", [req.params.id], (err) => {
-        if (err) return res.status(500).json({ error: err.message });
+    db.run("UPDATE notifications SET read = 1 WHERE id = ? AND user_id = ?", [req.params.id, req.user.id], function(err) {
+        if (err) return databaseError(res, err);
+        if (!this.changes) return res.status(404).json({ error: 'Notificação não encontrada.' });
         res.json({ message: 'Marked as read' });
     });
 });
 
 // --- Companies Routes ---
 app.get('/api/companies', (req, res) => {
-    db.all('SELECT * FROM companies ORDER BY name', [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+    const internal = ['admin_goldtech', 'tecnico'].includes(req.user.role);
+    db.all('SELECT * FROM companies' + (internal ? '' : ' WHERE id = ?') + ' ORDER BY name', internal ? [] : [req.user.company_id || null], (err, rows) => {
+        if (err) return databaseError(res, err);
         res.json(rows);
     });
 });
@@ -84,7 +73,7 @@ app.post('/api/companies', (req, res) => {
     const { name, trade_name, cnpj, contact_name, contact_email, phone, status } = req.body;
     const query = `INSERT INTO companies (name, trade_name, cnpj, contact_name, contact_email, phone, status) VALUES (?, ?, ?, ?, ?, ?, ?)`;
     db.run(query, [name, trade_name, cnpj, contact_name, contact_email, phone, status || 'Active'], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         res.status(201).json({ id: this.lastID });
     });
 });
@@ -93,7 +82,7 @@ app.put('/api/companies/:id', (req, res) => {
     const { name, trade_name, cnpj, contact_name, contact_email, phone, status } = req.body;
 
     db.get('SELECT * FROM companies WHERE id = ?', [req.params.id], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         if (!row) return res.status(404).json({ error: 'Cliente não encontrado.' });
 
         const updatedName           = name          !== undefined ? name          : row.name;
@@ -108,7 +97,7 @@ app.put('/api/companies/:id', (req, res) => {
             `UPDATE companies SET name=?, trade_name=?, cnpj=?, contact_name=?, contact_email=?, phone=?, status=? WHERE id=?`,
             [updatedName, updatedTradeName, updatedCnpj, updatedContact, updatedContactEmail, updatedPhone, updatedStatus, req.params.id],
             function(updateErr) {
-                if (updateErr) return res.status(500).json({ error: updateErr.message });
+                if (updateErr) return databaseError(res, updateErr);
                 res.json({ success: true });
             }
         );
@@ -117,7 +106,8 @@ app.put('/api/companies/:id', (req, res) => {
 
 // --- Users Routes ---
 app.get('/api/users', (req, res) => {
-    const { companyId } = req.query;
+    const companyId = ['admin_goldtech', 'tecnico'].includes(req.user.role) ? req.query.companyId : req.user.company_id;
+    if (!['admin_goldtech', 'tecnico'].includes(req.user.role) && !companyId) return res.status(403).json({ error: 'Permissão insuficiente.' });
     let query = `
         SELECT u.id, u.name, u.username, u.email, u.role, u.active, u.company_id, u.department, c.name as company_name 
         FROM users u 
@@ -131,7 +121,7 @@ app.get('/api/users', (req, res) => {
     query += ' ORDER BY u.name';
     
     db.all(query, params, (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         res.json(rows);
     });
 });
@@ -141,7 +131,7 @@ app.post('/api/users', (req, res) => {
     const normalizedRole = role ? role.toLowerCase() : 'cliente_usuario';
     const query = `INSERT INTO users (company_id, name, email, username, password_hash, role, department) VALUES (?, ?, ?, ?, ?, ?, ?)`;
     db.run(query, [company_id, name, email, username, password_hash, normalizedRole, department || null], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         res.status(201).json({ id: this.lastID });
     });
 });
@@ -149,7 +139,7 @@ app.post('/api/users', (req, res) => {
 app.put('/api/users/:id', (req, res) => {
     const { name, email, username, role, company_id, active, department } = req.body;
     db.get('SELECT * FROM users WHERE id = ?', [req.params.id], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         if (!row) return res.status(404).json({ error: 'User not found' });
 
         const updatedName       = name       !== undefined ? name       : row.name;
@@ -164,7 +154,7 @@ app.put('/api/users/:id', (req, res) => {
             `UPDATE users SET name=?, email=?, username=?, role=?, company_id=?, active=?, department=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
             [updatedName, updatedEmail, updatedUsername, updatedRole, updatedCompany, updatedActive, updatedDepartment, req.params.id],
             function(err) {
-                if (err) return res.status(500).json({ error: err.message });
+                if (err) return databaseError(res, err);
                 res.json({ message: 'User updated successfully' });
             }
         );
@@ -175,14 +165,14 @@ app.put('/api/users/:id/password', (req, res) => {
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: 'Password is required' });
 
-    // TODO: Implement bcrypt for password hashing
+    // The centralized authorization middleware has already hashed the new password.
     const passwordHash = password;
 
     db.run(
         `UPDATE users SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
         [passwordHash, req.params.id],
         function(err) {
-            if (err) return res.status(500).json({ error: err.message });
+            if (err) return databaseError(res, err);
             res.json({ success: true, message: 'Password updated successfully' });
         }
     );
@@ -191,7 +181,7 @@ app.put('/api/users/:id/password', (req, res) => {
 
 // --- Ticket Routes ---
 app.get('/api/tickets', (req, res) => {
-    const { userId, companyId, role, status, priority } = req.query;
+    const { status, priority } = req.query;
     
     let query = `
         SELECT t.*, 
@@ -208,12 +198,9 @@ app.get('/api/tickets', (req, res) => {
     let params = [];
     let conditions = [];
 
-    if (role === 'cliente_usuario') {
-        conditions.push('t.opened_by_user_id = ?');
-        params.push(userId);
-    } else if (role === 'cliente_gestor') {
+    if (!req.isInternal) {
         conditions.push('t.company_id = ?');
-        params.push(companyId);
+        params.push(req.user.company_id);
     }
 
     if (status) {
@@ -232,13 +219,12 @@ app.get('/api/tickets', (req, res) => {
     query += ' ORDER BY t.created_at DESC';
 
     db.all(query, params, (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         res.json(rows);
     });
 });
 
 app.get('/api/tickets/:id', (req, res) => {
-    const { userId, companyId, role } = req.query;
     const query = `
         SELECT t.*, 
             c.name as company_name, 
@@ -252,13 +238,12 @@ app.get('/api/tickets/:id', (req, res) => {
         WHERE t.id = ?
     `;
     db.get(query, [req.params.id], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         if (!row) return res.status(404).json({ error: 'Ticket not found' });
         
         // Security Check
-        const isAdminOrTech = role === 'admin_goldtech' || role === 'tecnico';
-        const isOwner = row.opened_by_user_id == userId;
-        const isSameCompany = row.company_id == companyId;
+        const isAdminOrTech = req.isInternal;
+        const isSameCompany = row.company_id === req.user.company_id;
 
         if (!isAdminOrTech && !isSameCompany) {
             return res.status(403).json({ error: 'Access denied' });
@@ -269,33 +254,10 @@ app.get('/api/tickets/:id', (req, res) => {
 });
 
 app.post('/api/tickets', (req, res) => {
-    const integrationSource = req.body.source;
-    const isIntegrationTicket = Boolean(integrationSource);
-
-    if (isIntegrationTicket) {
-        const expectedToken = process.env.HELPDESK_API_TOKEN;
-        const receivedToken = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-
-        if (expectedToken && receivedToken !== expectedToken) {
-            return res.status(401).json({ error: 'Invalid integration token' });
-        }
-    }
-
-    const title = req.body.title;
-    const description = req.body.description;
-    const category = req.body.category;
-    const assigned_technician_id = req.body.assigned_technician_id;
-    const company_id = req.body.company_id || req.body.client_id;
-    const opened_by_user_id = req.body.opened_by_user_id || Number(process.env.HELPDESK_SYSTEM_USER_ID || 1);
-    const priorityMap = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
-    const priority = priorityMap[String(req.body.priority || 'Medium').toLowerCase()] || req.body.priority || 'Medium';
-
-    if (!title || !company_id || !opened_by_user_id) {
-        return res.status(400).json({ error: 'title, company_id and opened_by_user_id are required' });
-    }
+    const { title, description, category, priority, company_id, opened_by_user_id, assigned_technician_id } = req.body;
     
     db.get("SELECT COUNT(*) as count FROM tickets", (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         const nextId = (row.count + 1).toString().padStart(4, '0');
         const year = new Date().getFullYear();
         const ticketNumber = `GT-${year}-${nextId}`;
@@ -329,7 +291,7 @@ app.post('/api/tickets', (req, res) => {
             const query = `INSERT INTO tickets (company_id, opened_by_user_id, ticket_number, title, description, category, priority, sla_deadline, assigned_technician_id, status, is_auto_assigned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
             
             db.run(query, [company_id, opened_by_user_id, ticketNumber, title, description, category, priority, slaDeadline, finalTechId, status, isAuto], function(err) {
-                if (err) return res.status(500).json({ error: err.message });
+                if (err) return databaseError(res, err);
                 const ticketId = this.lastID;
                 
                 // Notifications
@@ -348,7 +310,7 @@ app.put('/api/tickets/:id', (req, res) => {
     const { status, priority, assigned_technician_id } = req.body;
     
     db.get('SELECT * FROM tickets WHERE id = ?', [req.params.id], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         if (!row) return res.status(404).json({ error: 'Ticket not found' });
 
         const newStatus = status !== undefined ? status : row.status;
@@ -359,7 +321,7 @@ app.put('/api/tickets/:id', (req, res) => {
 
         const updateQuery = `UPDATE tickets SET status = ?, priority = ?, assigned_technician_id = ?, is_auto_assigned = ?, updated_at = CURRENT_TIMESTAMP, closed_at = ${closedAt} WHERE id = ?`;
         db.run(updateQuery, [newStatus, newPriority, newTech, isAuto, req.params.id], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
+            if (err) return databaseError(res, err);
             
             // Notification for assignment change
             if (assigned_technician_id && assigned_technician_id != row.assigned_technician_id) {
@@ -378,10 +340,11 @@ app.get('/api/tickets/:id/interactions', (req, res) => {
         FROM ticket_interactions ti
         JOIN users u ON ti.user_id = u.id
         WHERE ti.ticket_id = ?
+        ${req.isInternal ? '' : "AND ti.visible_to_client = 1 AND ti.interaction_type = 'message'"}
         ORDER BY ti.created_at ASC
     `;
     db.all(query, [req.params.id], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         res.json(rows);
     });
 });
@@ -391,9 +354,11 @@ app.post('/api/tickets/:id/interactions', (req, res) => {
     const ticket_id = req.params.id;
     
     db.get("SELECT ticket_number, assigned_technician_id, opened_by_user_id FROM tickets WHERE id = ?", [ticket_id], (err, ticket) => {
+        if (err) return res.status(500).json({ error: 'Não foi possível processar a solicitação.' });
+        if (!ticket) return res.status(404).json({ error: 'Chamado não encontrado.' });
         const query = `INSERT INTO ticket_interactions (ticket_id, user_id, message, interaction_type, visible_to_client) VALUES (?, ?, ?, ?, ?)`;
         db.run(query, [ticket_id, user_id, message, interaction_type || 'message', visible_to_client !== undefined ? visible_to_client : 1], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
+            if (err) return databaseError(res, err);
             
             // Notification logic
             if (ticket) {
@@ -424,7 +389,7 @@ app.get('/api/technicians/workload', (req, res) => {
         GROUP BY u.id 
         ORDER BY workload DESC
     `, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return databaseError(res, err);
         res.json(rows);
     });
 });
@@ -458,7 +423,7 @@ setInterval(() => {
             });
         }
     });
-}, 30000); // Every 30 seconds
+}, 30000).unref(); // Every 30 seconds; does not keep test instances alive.
 
 // --- Password Reset Routes ---
 
@@ -471,6 +436,10 @@ const mailer = nodemailer.createTransport({
         pass: process.env.SMTP_PASS,
     },
 });
+
+const visitMailer = require('./services/visit-graph-mailer').createVisitGraphMailer();
+require('./routes/visit-documents')(app, db, { mailer: visitMailer });
+require('./routes/visit-validations')(app, db, { mailer: visitMailer });
 
 const sendResetEmail = async (toEmail, resetLink) => {
     await mailer.sendMail({
@@ -494,13 +463,14 @@ app.post('/api/auth/forgot-password', (req, res) => {
     const { email } = req.body;
     const SAFE_MSG = 'Se o e-mail estiver cadastrado, enviaremos as instruções de recuperação.';
 
-    if (!email) return res.status(400).json({ error: 'E-mail obrigatório.' });
+    // Respond before account lookup or mail delivery, identically for all accounts.
+    res.json({ message: SAFE_MSG });
 
-    db.get('SELECT id, email FROM users WHERE email = ? AND active = 1', [email], async (err, user) => {
-        if (err) return res.status(500).json({ error: err.message });
+    db.get('SELECT id, email FROM users WHERE LOWER(TRIM(email)) = ? AND active = 1', [email], async (err, user) => {
+        if (err) { console.error('Password recovery lookup failed', { code: err.code }); return; }
 
         // Always respond with same message for security
-        if (!user) return res.json({ message: SAFE_MSG });
+        if (!user) return;
 
         const token = crypto.randomBytes(32).toString('hex');
         const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
@@ -509,57 +479,230 @@ app.post('/api/auth/forgot-password', (req, res) => {
             'UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE id = ?',
             [token, expires, user.id],
             async (updateErr) => {
-                if (updateErr) return res.status(500).json({ error: updateErr.message });
+                if (updateErr) { console.error('Password recovery update failed', { code: updateErr.code }); return; }
 
                 const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
                 const resetLink = `${frontendUrl}/reset-password?token=${token}`;
 
                 try {
-                    await sendResetEmail(user.email, resetLink);
+                    await (authOptions.sendResetEmail || sendResetEmail)(user.email, resetLink);
                 } catch (mailErr) {
-                    console.error('Erro ao enviar e-mail:', mailErr.message);
+                    console.error('Password recovery delivery failed', { code: mailErr.code || 'MAIL_ERROR' });
                     // Still respond OK so token is generated even if SMTP isn't configured
                 }
 
-                res.json({ message: SAFE_MSG });
             }
         );
     });
 });
 
-app.post('/api/auth/reset-password', (req, res) => {
-    const { token, password } = req.body;
-    if (!token || !password) return res.status(400).json({ error: 'Token e nova senha são obrigatórios.' });
-
-    db.get(
-        'SELECT id, reset_token_expires FROM users WHERE reset_token = ?',
-        [token],
-        (err, user) => {
-            if (err) return res.status(500).json({ error: err.message });
-            if (!user) return res.status(400).json({ error: 'Token inválido ou expirado.' });
-
-            const now = new Date();
-            const expires = new Date(user.reset_token_expires);
-            if (now > expires) return res.status(400).json({ error: 'Token expirado. Solicite uma nova redefinição.' });
-
-            // TODO: implementar bcrypt quando o sistema migrar para hash seguro
-            // Ex: const hash = await bcrypt.hash(password, 10);
-            db.run(
-                'UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expires = NULL WHERE id = ?',
-                [password, user.id],
-                (updateErr) => {
-                    if (updateErr) return res.status(500).json({ error: updateErr.message });
-                    res.json({ message: 'Senha redefinida com sucesso.' });
-                }
-            );
-        }
-    );
-});
+// Token-based password recovery is handled centrally by helpdesk-auth.
 
 // --- WhatsApp Integration ---
-const whatsappRoutes = require('./src/routes/whatsappRoutes');
-app.use('/api/whatsapp', whatsappRoutes);
+app.post('/api/whatsapp/webhook', (req, res) => {
+    const { phone, message } = req.body;
 
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    if (!phone || !message) {
+        return res.status(400).json({ error: 'Phone and message are required' });
+    }
+
+    const text = message.toLowerCase().trim();
+    console.log(`[WhatsApp Webhook] Recebido de ${phone}: ${text}`);
+
+    // Helpers
+    const reply = (msg) => res.json({ reply: msg });
+
+    const saveSession = (phone, step, data, callback) => {
+        db.get('SELECT id FROM whatsapp_sessions WHERE phone = ?', [phone], (err, row) => {
+            const dataStr = JSON.stringify(data);
+            if (row) {
+                db.run('UPDATE whatsapp_sessions SET step = ?, data = ?, updated_at = CURRENT_TIMESTAMP WHERE phone = ?', [step, dataStr, phone], callback);
+            } else {
+                db.run('INSERT INTO whatsapp_sessions (phone, step, data) VALUES (?, ?, ?)', [phone, step, dataStr], callback);
+            }
+        });
+    };
+
+    const deleteSession = (phone, callback) => {
+        db.run('DELETE FROM whatsapp_sessions WHERE phone = ?', [phone], callback);
+    };
+
+    // Check existing session
+    db.get('SELECT * FROM whatsapp_sessions WHERE phone = ?', [phone], (err, session) => {
+        if (err) return databaseError(res, err);
+
+        let sessionData = {};
+        if (session && session.data) {
+            try { sessionData = JSON.parse(session.data); } catch(e) {}
+        }
+
+        const step = session ? session.step : 'initial';
+        console.log(`[WhatsApp Webhook] Etapa atual para ${phone}: ${step}`);
+
+        // State Machine
+        if (step === 'initial') {
+            const triggers = ['abrir chamado', 'chamado', 'suporte', 'problema'];
+            if (triggers.some(t => text.includes(t))) {
+                saveSession(phone, 'awaiting_name', {}, () => {
+                    return reply("Olá! Percebi que você precisa de suporte. Por favor, me diga o seu *Nome*:");
+                });
+            } else {
+                return reply("Olá! Sou o assistente da GoldTech. Para abrir um chamado, digite *'abrir chamado'*, *'suporte'* ou *'problema'*.");
+            }
+        }
+        else if (step === 'awaiting_name') {
+            sessionData.name = message.trim();
+            saveSession(phone, 'awaiting_company', sessionData, () => {
+                return reply(`Certo, ${sessionData.name}. Qual o nome da sua *Empresa*?`);
+            });
+        }
+        else if (step === 'awaiting_company') {
+            sessionData.company = message.trim();
+            saveSession(phone, 'awaiting_sector', sessionData, () => {
+                return reply("Qual o seu *Setor/Departamento*?");
+            });
+        }
+        else if (step === 'awaiting_sector') {
+            sessionData.sector = message.trim();
+            saveSession(phone, 'awaiting_problem', sessionData, () => {
+                return reply("Por favor, descreva detalhadamente o *Problema* que está ocorrendo:");
+            });
+        }
+        else if (step === 'awaiting_problem') {
+            sessionData.problem = message.trim();
+            saveSession(phone, 'awaiting_priority', sessionData, () => {
+                return reply("Qual a *Prioridade* deste chamado?\nDigite o número correspondente:\n1 - Baixa\n2 - Média\n3 - Alta\n4 - Crítica");
+            });
+        }
+        else if (step === 'awaiting_priority') {
+            const priorityMap = {
+                '1': 'Low',
+                '2': 'Medium',
+                '3': 'High',
+                '4': 'Critical'
+            };
+
+            // Aceita 1, 2, 3, 4 ou o texto.
+            let priority = priorityMap[text] || null;
+            if (!priority) {
+                if (text.includes('baixa')) priority = 'Low';
+                else if (text.includes('média') || text.includes('media')) priority = 'Medium';
+                else if (text.includes('alta')) priority = 'High';
+                else if (text.includes('crítica') || text.includes('critica')) priority = 'Critical';
+            }
+
+            if (!priority) {
+                return reply("Prioridade inválida. Por favor, digite apenas um número (1 a 4).");
+            }
+
+            sessionData.priority = priority;
+
+            // Finalizar: Criar Ticket
+            createWhatsAppTicket(phone, sessionData, (err, ticketNumber) => {
+                deleteSession(phone, () => {
+                    if (err) {
+                        console.error('[WhatsApp Webhook] Erro ao criar chamado:', err);
+                        return reply("Desculpe, ocorreu um erro interno ao criar seu chamado. Tente novamente mais tarde.");
+                    }
+                    console.log(`[WhatsApp Webhook] Chamado ${ticketNumber} criado com sucesso para ${phone}.`);
+                    return reply(`✅ *Chamado Criado com Sucesso!*\n\nO número do seu protocolo é: *${ticketNumber}*\n\nNossa equipe já foi notificada e entrará em contato em breve.`);
+                });
+            });
+        }
+    });
 });
+
+function createWhatsAppTicket(phone, data, callback) {
+    // 1. Encontrar o user "Contato WhatsApp"
+    db.get("SELECT id, company_id FROM users WHERE username = 'whatsapp_user'", (err, wpUser) => {
+        if (err || !wpUser) {
+            return callback(err || new Error("Generic WhatsApp user not found"));
+        }
+
+        const company_id = wpUser.company_id;
+        const opened_by_user_id = wpUser.id;
+
+        // 2. Gerar Título e Ticket Number
+        db.get("SELECT COUNT(*) as count FROM tickets", (err, row) => {
+            if (err) return callback(err);
+
+            const nextId = (row.count + 1).toString().padStart(4, '0');
+            const year = new Date().getFullYear();
+            const ticketNumber = `GT-${year}-${nextId}`;
+
+            // Título: pega os primeiros 30 caracteres do problema
+            const title = data.problem.length > 30 ? data.problem.substring(0, 30) + '...' : data.problem;
+
+            // Descrição formata as informações capturadas
+            const description = `*Abertura via WhatsApp*\n\n` +
+                                `*Nome:* ${data.name}\n` +
+                                `*Empresa:* ${data.company}\n` +
+                                `*Setor:* ${data.sector}\n` +
+                                `*WhatsApp:* ${phone}\n\n` +
+                                `*Problema Relatado:*\n${data.problem}`;
+
+            const priority = data.priority;
+            const category = 'Outros'; // Categoria default
+
+            // SLA
+            const slaHoursMap = { 'Critical': 2, 'High': 4, 'Medium': 8, 'Low': 24 };
+            const slaHours = slaHoursMap[priority] || 24;
+            const slaDeadline = new Date(Date.now() + slaHours * 60 * 60 * 1000).toISOString();
+
+            // Auto-assign
+            const workloadQuery = `
+                SELECT u.id
+                FROM users u
+                LEFT JOIN tickets t ON u.id = t.assigned_technician_id AND t.status IN ('Open', 'In Progress')
+                WHERE (u.role = 'tecnico' OR LOWER(u.role) = 'tecnico' OR u.role = 'TÉCNICO') AND u.active = 1
+                GROUP BY u.id
+                ORDER BY COUNT(t.id) ASC
+                LIMIT 1
+            `;
+
+            db.get(workloadQuery, [], (err, techRow) => {
+                const assigned_technician_id = techRow ? techRow.id : null;
+                const is_auto_assigned = techRow ? 1 : 0;
+                const status = assigned_technician_id ? 'In Progress' : 'Open';
+
+                const insertQuery = `
+                    INSERT INTO tickets
+                    (company_id, opened_by_user_id, ticket_number, title, description, category, priority, sla_deadline, assigned_technician_id, status, is_auto_assigned, origin, whatsapp_number)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `;
+
+                db.run(insertQuery, [
+                    company_id, opened_by_user_id, ticketNumber, title, description, category, priority,
+                    slaDeadline, assigned_technician_id, status, is_auto_assigned, 'whatsapp', phone
+                ], function(err) {
+                    if (err) return callback(err);
+
+                    const ticketId = this.lastID;
+
+                    // Notificações
+                    notifyAdmins(ticketId, 'new_ticket', `Novo chamado via WhatsApp: ${ticketNumber}`);
+                    if (assigned_technician_id) {
+                        createNotification(assigned_technician_id, ticketId, 'assigned', `Chamado ${ticketNumber} foi atribuído a você (Origem: WhatsApp).`);
+                    }
+
+                    callback(null, ticketNumber);
+                });
+            });
+        });
+    });
+}
+
+app.use((error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    res.status(error.type === 'entity.parse.failed' ? 400 : 500).json({ error: 'Não foi possível processar a solicitação.' });
+});
+return app;
+}
+
+if (require.main === module) {
+    require('dotenv').config();
+    const app = createApp(require('./database'));
+    const port = process.env.PORT || 5000;
+    app.listen(port, () => console.log(`Server is running on port ${port}`));
+}
+module.exports = { createApp };

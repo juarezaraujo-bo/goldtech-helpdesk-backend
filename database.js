@@ -1,12 +1,13 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
-const dbPath = path.resolve(__dirname, 'helpdesk.sqlite');
+const dbPath = path.resolve(__dirname, process.env.DB_PATH || 'helpdesk.sqlite');
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
         console.error('Error opening database', err.message);
     } else {
         console.log('Connected to the SQLite database.');
+        db.run('PRAGMA foreign_keys = ON');
         
         db.serialize(() => {
             // Create tables
@@ -44,9 +45,17 @@ const db = new sqlite3.Database(dbPath, (err) => {
                 // Ignore error if column already exists
             });
 
-            // Safe migration: add updated_at column
-            db.run(`ALTER TABLE users ADD COLUMN updated_at DATETIME`, (err) => {
-                if (err) console.error("Migration error updated_at:", err.message);
+            // Legacy databases may not have updated_at yet.
+            db.all(`PRAGMA table_info(users)`, (err, columns) => {
+                if (err) {
+                    console.error("Migration error updated_at:", err.message);
+                    return;
+                }
+                if (!columns.some(column => column.name === 'updated_at')) {
+                    db.run(`ALTER TABLE users ADD COLUMN updated_at DATETIME`, (err) => {
+                        if (err) console.error("Migration error updated_at:", err.message);
+                    });
+                }
             });
 
             // Safe migrations for password reset
@@ -111,16 +120,17 @@ const db = new sqlite3.Database(dbPath, (err) => {
             db.run(`ALTER TABLE tickets ADD COLUMN origin TEXT DEFAULT 'web'`, () => {});
             db.run(`ALTER TABLE tickets ADD COLUMN whatsapp_number TEXT`, () => {});
 
-            // Ensure Generic WhatsApp Company and User exists for foreign key references
+            // Demo accounts must never be created on production or existing installations by default.
+            if (!['development', 'test'].includes(process.env.NODE_ENV) || process.env.ENABLE_DEV_SEED !== 'true') return;
+
+            // Ensure Generic WhatsApp Company and User exists for foreign key references (DEV seed only)
             db.get("SELECT id FROM companies WHERE name = 'Clientes WhatsApp'", (err, row) => {
                 if (!row) {
-                    db.run(`INSERT INTO companies (name, trade_name, cnpj) VALUES (?, ?, ?)`, ['Clientes WhatsApp', 'WhatsApp', '99999999999999'], function(err) {
+                    db.run(`INSERT INTO companies (name, trade_name, cnpj) VALUES (?, ?, ?)`, ['Clientes WhatsApp', 'WhatsApp', '00000000000000'], function(err) {
                         if (!err) {
                             const companyId = this.lastID;
                             db.run(`INSERT INTO users (company_id, name, email, username, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)`,
                             [companyId, 'Contato WhatsApp', 'whatsapp@system.local', 'whatsapp_user', 'no_login_needed', 'cliente_usuario']);
-                        } else {
-                            console.error("Migration error company WhatsApp:", err.message);
                         }
                     });
                 }
