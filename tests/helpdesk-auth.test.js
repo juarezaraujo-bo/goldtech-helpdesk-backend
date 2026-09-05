@@ -313,9 +313,9 @@ test('criação usa identidade da sessão e rejeita empresa, autor e técnico fo
   assert.equal(row.company_id,1); assert.equal(row.opened_by_user_id,3); assert.equal(row.assigned_technician_id,2);
 });
 
-test('técnico e admin mantêm acesso operacional, autoria própria e atribuição apenas interna', async t => {
+test('admin mantém acesso operacional a chamados e atribuição interna', async t => {
   const f = await ticketFixture(t);
-  for (const [username,id] of [['tech',2],['admin',1]]) {
+  for (const [username,id] of [['admin',1]]) {
     const { cookie } = await f.login(username);
     assert.equal((await f.request('/api/tickets',{cookie})).body.length>=2,true);
     assert.equal((await f.request('/api/tickets/2',{cookie})).status,200);
@@ -329,10 +329,50 @@ test('técnico e admin mantêm acesso operacional, autoria própria e atribuiç�
   }
 });
 
+test('técnico fica restrito às próprias visitas e não acessa áreas administrativas', async t => {
+  const f = await fixture(t);
+  await f.exec(`INSERT INTO company_contacts(company_id,contact_type,name,email,job_title) VALUES
+    (1,'primary_manager','Gestor','gestor@example.test','Diretor'),(1,'substitute','Substituto','sub@example.test','Supervisor');
+    INSERT INTO company_departments(id,company_id,name) VALUES(1,1,'TI');
+    INSERT INTO technical_visits(id,visit_number,company_id,technician_user_id,visit_type,status,created_by_user_id) VALUES
+    (1,'VIS-OWN',1,2,'preventive','draft',1),(2,'VIS-OTHER',1,1,'preventive','draft',1);
+    INSERT INTO technical_visit_departments(id,visit_id,department_id,department_name_snapshot) VALUES(1,1,1,'TI'),(2,2,1,'TI');`);
+  const { cookie } = await f.login('tech');
+  const list = await f.request('/api/visits?technicianId=1', { cookie });
+  assert.equal(list.status, 200); assert.deepEqual(list.body.map(row => row.id), [1]);
+  assert.equal((await f.request('/api/visits/1', { cookie })).status, 200);
+  assert.equal((await f.request('/api/visits/2', { cookie })).status, 403);
+  assert.equal((await f.request('/api/visits/2/start', { method: 'POST', cookie })).status, 403);
+  assert.equal((await f.request('/api/visits/2/departments/2', { method: 'PUT', cookie, body: { demand_status: 'sem_demanda' } })).status, 403);
+  assert.equal((await f.request('/api/visits/2/departments/2/complete', { method: 'POST', cookie })).status, 403);
+  assert.equal((await f.request('/api/visits/2/departments/2/request-validation', { method: 'POST', cookie, body: { contact_type: 'primary_manager' } })).status, 403);
+  assert.equal((await f.request('/api/visits/2/finish', { method: 'POST', cookie })).status, 403);
+  assert.equal((await f.request('/api/visits/2/documents', { cookie })).status, 403);
+  assert.equal((await f.request('/api/visits/managers?companyId=1&visitId=1', { cookie })).status, 200);
+  assert.equal((await f.request('/api/visits/managers?companyId=2&visitId=1', { cookie })).status, 403);
+  assert.equal((await f.request('/api/visits', { method: 'POST', cookie, body: { company_id: 1 } })).status, 403);
+  for (const url of ['/api/users','/api/companies','/api/technicians/workload','/api/tickets','/api/notifications']) {
+    assert.equal((await f.request(url, { cookie })).status, 403, url);
+  }
+});
+
+test('admin continua acessando visitas próprias e de outros técnicos', async t => {
+  const f = await fixture(t);
+  await f.exec(`INSERT INTO company_departments(id,company_id,name) VALUES(1,1,'TI');
+    INSERT INTO technical_visits(id,visit_number,company_id,technician_user_id,visit_type,status,created_by_user_id) VALUES
+    (1,'VIS-TECH',1,2,'preventive','draft',1);`);
+  const { cookie } = await f.login('admin');
+  assert.equal((await f.request('/api/visits', { cookie })).status, 200);
+  assert.equal((await f.request('/api/visits/1', { cookie })).status, 200);
+  assert.equal((await f.request('/api/users', { cookie })).status, 200);
+  assert.equal((await f.request('/api/companies', { cookie })).status, 200);
+  assert.equal((await f.request('/api/technicians/workload', { cookie })).status, 200);
+});
+
 test('interações isolam notas internas e rejeitam autor/visibilidade forjados', async t => {
-  const f = await ticketFixture(t); const client=await f.login('client'),tech=await f.login('tech');
+  const f = await ticketFixture(t); const client=await f.login('client'),admin=await f.login('admin');
   assert.equal((await f.request('/api/tickets/1/interactions',{cookie:client.cookie})).body.length,1);
-  assert.equal((await f.request('/api/tickets/1/interactions',{cookie:tech.cookie})).body.length,3);
+  assert.equal((await f.request('/api/tickets/1/interactions',{cookie:admin.cookie})).body.length,3);
   for(const body of [{user_id:2,message:'Forged'},{message:'Forged',visible_to_client:0},{message:'Forged',interaction_type:'internal_note'}]) {
     assert.equal((await f.request('/api/tickets/1/interactions',{cookie:client.cookie,method:'POST',body})).status,403);
   }
@@ -340,7 +380,7 @@ test('interações isolam notas internas e rejeitam autor/visibilidade forjados'
   assert.equal(created.status,201);
   const row=await f.get('SELECT * FROM ticket_interactions WHERE id=?',[created.body.id]);
   assert.equal(row.user_id,3);assert.equal(row.visible_to_client,1);assert.equal(row.interaction_type,'message');
-  const note=await f.request('/api/tickets/1/interactions',{cookie:tech.cookie,method:'POST',body:{message:'Private',interaction_type:'internal_note',visible_to_client:1}});
+  const note=await f.request('/api/tickets/1/interactions',{cookie:admin.cookie,method:'POST',body:{message:'Private',interaction_type:'internal_note',visible_to_client:1}});
   assert.equal(note.status,201);
   assert.equal((await f.get('SELECT visible_to_client FROM ticket_interactions WHERE id=?',[note.body.id])).visible_to_client,0);
 });

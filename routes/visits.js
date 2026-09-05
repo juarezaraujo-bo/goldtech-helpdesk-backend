@@ -39,7 +39,8 @@ module.exports=function registerVisitRoutes(app,db){
   db.run('PRAGMA foreign_keys = ON');
   app.get('/api/visits',asyncRoute(async(req,res)=>{
     const conditions=[],params=[];
-    if(req.query.technicianId!==undefined){const id=asId(req.query.technicianId);if(!id)return res.status(400).json({error:'technicianId inválido.'});conditions.push('v.technician_user_id=?');params.push(id)}
+    if(req.user&&req.user.role==='tecnico'){conditions.push('v.technician_user_id=?');params.push(req.user.id)}
+    else if(req.query.technicianId!==undefined){const id=asId(req.query.technicianId);if(!id)return res.status(400).json({error:'technicianId inválido.'});conditions.push('v.technician_user_id=?');params.push(id)}
     if(req.query.status){conditions.push('v.status=?');params.push(req.query.status)}
     const where=conditions.length?' WHERE '+conditions.join(' AND '):'';
     const rows=await all(db,"SELECT v.*,c.name AS company_name,u.name AS unit_name,t.name AS technician_name,(SELECT COUNT(*) FROM technical_visit_departments vd WHERE vd.visit_id=v.id) AS department_count,(SELECT COUNT(*) FROM technical_visit_departments vd WHERE vd.visit_id=v.id AND vd.validation_status='validated') AS validated_count FROM technical_visits v JOIN companies c ON c.id=v.company_id LEFT JOIN company_units u ON u.id=v.unit_id JOIN users t ON t.id=v.technician_user_id"+where+' ORDER BY v.created_at DESC,v.id DESC',params);

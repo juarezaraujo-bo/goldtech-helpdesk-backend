@@ -131,12 +131,32 @@ function installHelpdeskAuth(app, db, { env = process.env, now = Date.now } = {}
     if (['GET', 'POST'].includes(req.method) && /^\/public\/validate\/[^/]+\/?$/i.test(req.path)) return next();
     requireSession(req, res, () => {
       if (!['admin_goldtech', 'tecnico'].includes(req.user.role)) return res.status(403).json({ error: 'Permissão insuficiente.' });
-      // Audit actor comes from the session, not a forged frontend identity.
-      if (req.method === 'POST' && /^\/?$/.test(req.path)) { req.body ||= {}; req.body.created_by_user_id = req.user.id; }
-      next();
+      if (req.user.role === 'admin_goldtech') {
+        if (req.method === 'POST' && /^\/?$/.test(req.path)) { req.body ||= {}; req.body.created_by_user_id = req.user.id; }
+        return next();
+      }
+      safe(async () => {
+        if (req.method === 'GET' && /^\/?$/.test(req.path)) {
+          return next();
+        }
+        if (req.method === 'GET' && /^\/managers\/?$/i.test(req.path)) {
+          const companyId = Number(req.query.companyId);
+          const visit = Number.isInteger(companyId) && companyId > 0
+            ? await get(db, 'SELECT id FROM technical_visits WHERE company_id=? AND technician_user_id=? LIMIT 1', [companyId, req.user.id])
+            : null;
+          if (!visit) return res.status(403).json({ error: 'Permissão insuficiente.' });
+          return next();
+        }
+        const match = /^\/(\d+)(?:\/|$)/.exec(req.path);
+        if (!match) return res.status(403).json({ error: 'Permissão insuficiente.' });
+        const visit = await get(db, 'SELECT technician_user_id FROM technical_visits WHERE id=?', [match[1]]);
+        if (!visit || visit.technician_user_id !== req.user.id) return res.status(403).json({ error: 'Permissão insuficiente.' });
+        return next();
+      })(req, res, next);
     });
   });
   app.use('/api/users', requireSession, safe(async (req, res, next) => {
+    if (req.user.role === 'tecnico') return res.status(403).json({ error: 'Permissão insuficiente.' });
     if (req.method === 'GET') return next();
     if (!['admin_goldtech', 'cliente_gestor'].includes(req.user.role)) return res.status(403).json({ error: 'Permissão insuficiente.' });
     const body = req.body || {};
@@ -160,14 +180,15 @@ function installHelpdeskAuth(app, db, { env = process.env, now = Date.now } = {}
   // Company writes can otherwise corrupt the identities used by visit catalogs.
   app.use('/api/companies', (req, res, next) => {
     requireSession(req, res, () => {
+      if (req.user.role === 'tecnico') return res.status(403).json({ error: 'Permissão insuficiente.' });
       if (!['GET', 'HEAD'].includes(req.method) && req.user.role !== 'admin_goldtech') return res.status(403).json({ error: 'Permissão insuficiente.' });
       next();
     });
   });
   const internal = user => ['admin_goldtech', 'tecnico'].includes(user.role);
   const denied = res => res.status(403).json({ error: 'Permissão insuficiente.' });
-  app.use('/api/technicians', requireSession, (req, res, next) => internal(req.user) ? next() : denied(res));
-  app.use('/api/notifications', requireSession);
+  app.use('/api/technicians', requireSession, (req, res, next) => req.user.role === 'admin_goldtech' ? next() : denied(res));
+  app.use('/api/notifications', requireSession, (req, res, next) => req.user.role === 'tecnico' ? denied(res) : next());
   app.use('/api/tickets', (req, res, next) => {
     const body = req.body || {};
     const isIntegrationTicket =
@@ -210,6 +231,7 @@ function installHelpdeskAuth(app, db, { env = process.env, now = Date.now } = {}
   });
 
   app.use('/api/tickets', safe(async (req, res, next) => {
+    if (req.user.role === 'tecnico') return denied(res);
     req.isInternal = req.isIntegration === true || internal(req.user);
     const body = req.body ||= {};
     if (req.isIntegration === true) {
