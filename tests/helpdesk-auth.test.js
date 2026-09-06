@@ -333,7 +333,8 @@ test('técnico fica restrito às próprias visitas e não acessa áreas administ
   const f = await fixture(t);
   await f.exec(`INSERT INTO company_contacts(company_id,contact_type,name,email,job_title) VALUES
     (1,'primary_manager','Gestor','gestor@example.test','Diretor'),(1,'substitute','Substituto','sub@example.test','Supervisor');
-    INSERT INTO company_departments(id,company_id,name) VALUES(1,1,'TI');
+    INSERT INTO company_units(id,company_id,name) VALUES(1,1,'Matriz');
+    INSERT INTO company_departments(id,company_id,unit_id,name) VALUES(1,1,1,'TI');
     INSERT INTO technical_visits(id,visit_number,company_id,technician_user_id,visit_type,status,created_by_user_id) VALUES
     (1,'VIS-OWN',1,2,'preventive','draft',1),(2,'VIS-OTHER',1,1,'preventive','draft',1);
     INSERT INTO technical_visit_departments(id,visit_id,department_id,department_name_snapshot) VALUES(1,1,1,'TI'),(2,2,1,'TI');`);
@@ -348,10 +349,24 @@ test('técnico fica restrito às próprias visitas e não acessa áreas administ
   assert.equal((await f.request('/api/visits/2/departments/2/request-validation', { method: 'POST', cookie, body: { contact_type: 'primary_manager' } })).status, 403);
   assert.equal((await f.request('/api/visits/2/finish', { method: 'POST', cookie })).status, 403);
   assert.equal((await f.request('/api/visits/2/documents', { cookie })).status, 403);
-  assert.equal((await f.request('/api/visits/managers?companyId=1&visitId=1', { cookie })).status, 200);
-  assert.equal((await f.request('/api/visits/managers?companyId=2&visitId=1', { cookie })).status, 403);
-  assert.equal((await f.request('/api/visits', { method: 'POST', cookie, body: { company_id: 1 } })).status, 403);
-  for (const url of ['/api/users','/api/companies','/api/technicians/workload','/api/tickets','/api/notifications']) {
+  assert.equal((await f.request('/api/visits/managers?companyId=1', { cookie })).status, 200);
+  assert.equal((await f.request('/api/visits/units?companyId=1', { cookie })).status, 200);
+  assert.equal((await f.request('/api/visits/departments?companyId=1&unitId=1', { cookie })).status, 200);
+  const companies = await f.request('/api/companies', { cookie });
+  assert.equal(companies.status, 200); assert.deepEqual(companies.body.map(company => company.id), [1,2]);
+  assert.equal((await f.request('/api/visits/managers?companyId=2', { cookie })).status, 200);
+  const created = await f.request('/api/visits', { method: 'POST', cookie, body: {
+    company_id: 1, unit_id: 1, department_ids: [1], technician_id: 1, created_by_user_id: 1
+  } });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.technician_user_id, 2);
+  assert.equal(created.body.created_by_user_id, 2);
+  for (const [method,url] of [
+    ['POST','/api/companies'],['POST','/api/visits/managers'],['PUT','/api/visits/managers/1'],
+    ['POST','/api/visits/units'],['PUT','/api/visits/units/1'],
+    ['POST','/api/visits/departments'],['PUT','/api/visits/departments/1']
+  ]) assert.equal((await f.request(url, { method, cookie, body: {} })).status, 403, method+' '+url);
+  for (const url of ['/api/users','/api/technicians/workload','/api/tickets','/api/notifications']) {
     assert.equal((await f.request(url, { cookie })).status, 403, url);
   }
 });

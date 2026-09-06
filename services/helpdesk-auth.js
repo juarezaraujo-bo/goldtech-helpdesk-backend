@@ -136,15 +136,21 @@ function installHelpdeskAuth(app, db, { env = process.env, now = Date.now } = {}
         return next();
       }
       safe(async () => {
+        if (req.method === 'POST' && /^\/?$/.test(req.path)) {
+          req.body ||= {};
+          req.body.technician_id = req.user.id;
+          req.body.created_by_user_id = req.user.id;
+          return next();
+        }
         if (req.method === 'GET' && /^\/?$/.test(req.path)) {
           return next();
         }
-        if (req.method === 'GET' && /^\/managers\/?$/i.test(req.path)) {
+        if (req.method === 'GET' && /^\/(?:managers|units|departments)\/?$/i.test(req.path)) {
           const companyId = Number(req.query.companyId);
-          const visit = Number.isInteger(companyId) && companyId > 0
-            ? await get(db, 'SELECT id FROM technical_visits WHERE company_id=? AND technician_user_id=? LIMIT 1', [companyId, req.user.id])
+          const company = Number.isInteger(companyId) && companyId > 0
+            ? await get(db, "SELECT id FROM companies WHERE id=? AND COALESCE(status,'Active')<>'Inactive'", [companyId])
             : null;
-          if (!visit) return res.status(403).json({ error: 'Permissão insuficiente.' });
+          if (!company) return res.status(403).json({ error: 'Permissão insuficiente.' });
           return next();
         }
         const match = /^\/(\d+)(?:\/|$)/.exec(req.path);
@@ -180,7 +186,7 @@ function installHelpdeskAuth(app, db, { env = process.env, now = Date.now } = {}
   // Company writes can otherwise corrupt the identities used by visit catalogs.
   app.use('/api/companies', (req, res, next) => {
     requireSession(req, res, () => {
-      if (req.user.role === 'tecnico') return res.status(403).json({ error: 'Permissão insuficiente.' });
+      if (req.user.role === 'tecnico' && !['GET', 'HEAD'].includes(req.method)) return res.status(403).json({ error: 'Permissão insuficiente.' });
       if (!['GET', 'HEAD'].includes(req.method) && req.user.role !== 'admin_goldtech') return res.status(403).json({ error: 'Permissão insuficiente.' });
       next();
     });

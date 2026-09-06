@@ -48,7 +48,7 @@ module.exports=function registerVisitRoutes(app,db){
   }));
   app.post('/api/visits',asyncRoute(async(req,res)=>{
     if(rejectsTimestamps(req.body))return res.status(400).json({error:'Horários operacionais são definidos exclusivamente pelo servidor.'});
-    const companyId=asId(req.body.company_id),technicianId=asId(req.body.technician_id),createdById=asId(req.body.created_by_user_id)||technicianId;
+    const companyId=asId(req.body.company_id),technicianId=req.user?.role==='tecnico'?req.user.id:asId(req.body.technician_id),createdById=req.user?.role==='tecnico'?req.user.id:(asId(req.body.created_by_user_id)||technicianId);
     const unitId=req.body.unit_id===undefined||req.body.unit_id===null||req.body.unit_id===''?null:asId(req.body.unit_id);
     const type=text(req.body.visit_type)||'preventive';
     const departmentIds=[...new Set(Array.isArray(req.body.department_ids)?req.body.department_ids.map(asId):[])];

@@ -62,8 +62,14 @@ app.put('/api/notifications/:id/read', (req, res) => {
 
 // --- Companies Routes ---
 app.get('/api/companies', (req, res) => {
-    const internal = ['admin_goldtech', 'tecnico'].includes(req.user.role);
-    db.all('SELECT * FROM companies' + (internal ? '' : ' WHERE id = ?') + ' ORDER BY name', internal ? [] : [req.user.company_id || null], (err, rows) => {
+    const admin = req.user.role === 'admin_goldtech';
+    const technician = req.user.role === 'tecnico';
+    const sql = admin
+        ? 'SELECT * FROM companies ORDER BY name'
+        : technician
+            ? "SELECT id,name,trade_name,status FROM companies WHERE COALESCE(status,'Active')<>'Inactive' ORDER BY name"
+            : 'SELECT * FROM companies WHERE id = ? ORDER BY name';
+    db.all(sql, admin || technician ? [] : [req.user.company_id || null], (err, rows) => {
         if (err) return databaseError(res, err);
         res.json(rows);
     });
