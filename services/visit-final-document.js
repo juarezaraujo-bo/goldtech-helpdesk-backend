@@ -26,8 +26,11 @@ function createFinalDocumentService(db, options = {}) {
     if (visit.status !== 'validated') reject(409, 'O comprovante só pode ser gerado após a validação completa.');
     const departments = await all(db, "SELECT vd.*,d.name AS department_name,(SELECT vr.protocol FROM visit_validation_requests vr WHERE vr.visit_department_id=vd.id AND vr.status='validated' ORDER BY vr.validated_at DESC,vr.id DESC LIMIT 1) AS validation_protocol FROM technical_visit_departments vd JOIN company_departments d ON d.id=vd.department_id WHERE vd.visit_id=? ORDER BY vd.id", [visitId]);
     if (!departments.length || departments.some(item => item.validation_status !== 'validated')) reject(409, 'Todos os setores devem estar validados.');
-    const manager = await get(db, "SELECT * FROM company_contacts WHERE company_id=? AND contact_type='primary_manager' AND active=1", [visit.company_id]);
-    if (!manager) reject(409, 'Gestor principal ativo não encontrado.');
+    let managers = await all(db, "SELECT DISTINCT c.name,c.email FROM company_contacts c JOIN technical_visit_departments vd ON vd.department_id=c.department_id WHERE vd.visit_id=? AND c.company_id=? AND c.contact_type='primary_manager' AND c.active=1 ORDER BY c.id", [visitId, visit.company_id]);
+    if (!managers.length) {
+      managers = await all(db, "SELECT DISTINCT vr.recipient_name AS name,vr.recipient_email AS email FROM visit_validation_requests vr JOIN technical_visit_departments vd ON vd.id=vr.visit_department_id WHERE vd.visit_id=? AND vr.contact_type_snapshot='primary_manager' AND vr.status='validated' ORDER BY vr.id", [visitId]);
+    }
+    if (!managers.length) reject(409, 'Responsável principal ativo não encontrado para os setores da visita.');
     if (!archiveEmail) reject(409, 'E-mail de arquivo da Goldtech não configurado.');
 
     let document = await get(db, "SELECT * FROM visit_documents WHERE visit_id=? AND document_type='final' AND version=1", [visitId]);
@@ -48,7 +51,7 @@ function createFinalDocumentService(db, options = {}) {
     if (!outputPath.startsWith(storageRoot + path.sep)) reject(500, 'Caminho do comprovante inválido.');
     if (await hashFile(outputPath) !== document.sha256) reject(500, 'Integridade do comprovante inválida.');
 
-    const recipients = [{ type: 'primary_manager', name: manager.name, email: manager.email }];
+    const recipients = managers.map(manager => ({ type: 'primary_manager', name: manager.name, email: manager.email }));
     if (send_validator_copy !== false) {
       const validators = await all(db, "SELECT DISTINCT recipient_name AS name,recipient_email AS email FROM visit_validation_requests vr JOIN technical_visit_departments vd ON vd.id=vr.visit_department_id WHERE vd.visit_id=? AND vr.status='validated'", [visitId]);
       for (const validator of validators) recipients.push({ type: 'validator', ...validator });

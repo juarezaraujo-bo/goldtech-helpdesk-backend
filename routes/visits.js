@@ -79,8 +79,8 @@ module.exports=function registerVisitRoutes(app,db){
     const id=asId(req.params.id);const visit=id&&await get(db,'SELECT * FROM technical_visits WHERE id=?',[id]);
     if(!visit)return res.status(404).json({error:'Visita não encontrada.'});
     if(!['draft','scheduled'].includes(visit.status))return res.status(409).json({error:'A visita não pode ser iniciada neste status.'});
-    const contacts=await all(db,"SELECT contact_type FROM company_contacts WHERE company_id=? AND active=1 AND contact_type IN ('primary_manager','substitute')",[visit.company_id]);
-    if(!contacts.some(c=>c.contact_type==='primary_manager')||!contacts.some(c=>c.contact_type==='substitute'))return res.status(409).json({error:'Cadastre um gestor principal e um substituto ativos antes de iniciar a visita.'});
+    const missingPrimary=await get(db,"SELECT COUNT(*) AS count FROM technical_visit_departments vd WHERE vd.visit_id=? AND NOT EXISTS (SELECT 1 FROM company_contacts c WHERE c.company_id=? AND c.department_id=vd.department_id AND c.contact_type='primary_manager' AND c.active=1)",[id,visit.company_id]);
+    if(missingPrimary.count>0)return res.status(409).json({error:'Cadastre um responsável principal ativo para cada setor antes de iniciar a visita.'});
     await transaction(db,async()=>{await run(db,"UPDATE technical_visits SET status='in_progress',started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",[id]);await audit(db,id,null,visit.technician_user_id,'visit_started')});
     return res.json(await loadVisit(db,id));
   }));

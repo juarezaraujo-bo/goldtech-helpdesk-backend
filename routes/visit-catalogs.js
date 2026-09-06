@@ -40,6 +40,9 @@ function asyncRoute(handler) {
 async function companyExists(db, companyId) {
   return Boolean(await get(db, 'SELECT id FROM companies WHERE id = ?', [companyId]));
 }
+async function departmentBelongsToCompany(db, departmentId, companyId) {
+  return Boolean(await get(db, 'SELECT id FROM company_departments WHERE id = ? AND company_id = ?', [departmentId, companyId]));
+}
 
 module.exports = function registerVisitCatalogRoutes(app, db) {
   db.run('PRAGMA foreign_keys = ON');
@@ -47,23 +50,32 @@ module.exports = function registerVisitCatalogRoutes(app, db) {
   app.get('/api/visits/managers', asyncRoute(async (req, res) => {
     const companyId = asId(req.query.companyId);
     if (!companyId) return res.status(400).json({ error: 'companyId é obrigatório.' });
-    const rows = await all(db, 'SELECT * FROM company_contacts WHERE company_id = ? ORDER BY active DESC, contact_type, name', [companyId]);
+    const departmentId = req.query.departmentId === undefined || req.query.departmentId === '' ? null : asId(req.query.departmentId);
+    if (req.query.departmentId !== undefined && req.query.departmentId !== '' && !departmentId) return res.status(400).json({ error: 'departmentId inválido.' });
+    if (departmentId && !await departmentBelongsToCompany(db, departmentId, companyId)) return res.status(400).json({ error: 'O setor não pertence à empresa informada.' });
+    let sql = 'SELECT c.*, d.name AS department_name FROM company_contacts c LEFT JOIN company_departments d ON d.id=c.department_id WHERE c.company_id = ?';
+    const params = [companyId];
+    if (departmentId) { sql += ' AND c.department_id = ?'; params.push(departmentId); }
+    sql += ' ORDER BY c.active DESC, c.department_id, c.contact_type, c.name';
+    const rows = await all(db, sql, params);
     return res.json(rows);
   }));
 
   app.post('/api/visits/managers', asyncRoute(async (req, res) => {
     const companyId = asId(req.body.company_id);
+    const departmentId = asId(req.body.department_id);
     const contactType = text(req.body.contact_type, true);
     const name = text(req.body.name, true);
     const email = text(req.body.email, true);
     const phone = text(req.body.phone);
     const jobTitle = text(req.body.job_title, true);
     const active = asActive(req.body.active);
-    if (!companyId || !CONTACT_TYPES.has(contactType) || !name || !email || !EMAIL_PATTERN.test(email) || !jobTitle || active === null) {
-      return res.status(400).json({ error: 'Empresa, tipo, nome, e-mail válido, função e situação são obrigatórios.' });
+    if (!companyId || !departmentId || !CONTACT_TYPES.has(contactType) || !name || !email || !EMAIL_PATTERN.test(email) || !jobTitle || active === null) {
+      return res.status(400).json({ error: 'Empresa, setor, tipo, nome, e-mail válido, função e situação são obrigatórios.' });
     }
     if (!await companyExists(db, companyId)) return res.status(404).json({ error: 'Empresa não encontrada.' });
-    const result = await run(db, 'INSERT INTO company_contacts (company_id, contact_type, name, email, phone, job_title, active) VALUES (?, ?, ?, ?, ?, ?, ?)', [companyId, contactType, name, email, phone, jobTitle, active]);
+    if (!await departmentBelongsToCompany(db, departmentId, companyId)) return res.status(400).json({ error: 'O setor não pertence à empresa informada.' });
+    const result = await run(db, 'INSERT INTO company_contacts (company_id, department_id, contact_type, name, email, phone, job_title, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [companyId, departmentId, contactType, name, email, phone, jobTitle, active]);
     const created = await get(db, 'SELECT * FROM company_contacts WHERE id = ?', [result.lastID]);
     return res.status(201).json(created);
   }));
@@ -74,6 +86,8 @@ module.exports = function registerVisitCatalogRoutes(app, db) {
     const current = await get(db, 'SELECT * FROM company_contacts WHERE id = ?', [id]);
     if (!current) return res.status(404).json({ error: 'Responsável não encontrado.' });
     if (req.body.company_id !== undefined && asId(req.body.company_id) !== current.company_id) return res.status(400).json({ error: 'Não é permitido mover o responsável para outra empresa.' });
+    const departmentId = req.body.department_id === undefined ? current.department_id : asId(req.body.department_id);
+    if (!departmentId || !await departmentBelongsToCompany(db, departmentId, current.company_id)) return res.status(400).json({ error: 'O setor deve pertencer à empresa do responsável.' });
     const contactType = req.body.contact_type === undefined ? current.contact_type : text(req.body.contact_type, true);
     const name = req.body.name === undefined ? current.name : text(req.body.name, true);
     const email = req.body.email === undefined ? current.email : text(req.body.email, true);
@@ -81,7 +95,7 @@ module.exports = function registerVisitCatalogRoutes(app, db) {
     const jobTitle = req.body.job_title === undefined ? current.job_title : text(req.body.job_title, true);
     const active = asActive(req.body.active, current.active);
     if (!CONTACT_TYPES.has(contactType) || !name || !email || !EMAIL_PATTERN.test(email) || !jobTitle || active === null) return res.status(400).json({ error: 'Tipo, nome, e-mail válido, função e situação são obrigatórios.' });
-    await run(db, 'UPDATE company_contacts SET contact_type=?, name=?, email=?, phone=?, job_title=?, active=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', [contactType, name, email, phone, jobTitle, active, id]);
+    await run(db, 'UPDATE company_contacts SET department_id=?, contact_type=?, name=?, email=?, phone=?, job_title=?, active=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', [departmentId, contactType, name, email, phone, jobTitle, active, id]);
     return res.json(await get(db, 'SELECT * FROM company_contacts WHERE id = ?', [id]));
   }));
 

@@ -9,6 +9,7 @@ const { promisify } = require('node:util');
 const sqlite3 = require('sqlite3');
 const { createApp } = require('../server');
 const migration = require('../migrations/001_create_visits_schema');
+const contactScopeMigration = require('../migrations/002_scope_company_contacts_by_department');
 const { verifyPassword } = require('../services/helpdesk-auth');
 
 async function fixture(t, production = false, envOverrides = {}) {
@@ -28,7 +29,7 @@ async function fixture(t, production = false, envOverrides = {}) {
       (3,1,'Cliente','client@example.test','client','legacy-pass','cliente_usuario'),
       (4,1,'Gestor','manager@example.test','manager','legacy-pass','cliente_gestor'),
       (5,2,'Outro','other@example.test','other','legacy-pass','cliente_usuario');
-  ` + migration.up);
+  ` + migration.up + contactScopeMigration.up);
   let current = Date.now();
   const env = { NODE_ENV: production ? 'production' : 'test', FRONTEND_URL: production ? 'https://helpdesk.example.test' : 'http://localhost:5173', SESSION_TTL_MS: '1000' };
   Object.assign(env, envOverrides);
@@ -119,13 +120,13 @@ test('gestor só gerencia perfis de cliente da própria empresa; filtro não é 
 
 test('admin percorre cadastros e operação de visita com sessão e POST sem corpo como o frontend', async t => {
   const f = await fixture(t); const { cookie } = await f.login();
-  for (const contact_type of ['primary_manager', 'substitute']) {
-    assert.equal((await f.request('/api/visits/managers', { method: 'POST', cookie, body: { company_id: 1, contact_type, name: 'Gestor', email: contact_type+'@example.test', job_title: 'Gestor' } })).status, 201);
-  }
   const unit = await f.request('/api/visits/units', { method: 'POST', cookie, body: { company_id: 1, name: 'Matriz' } });
   assert.equal(unit.status, 201);
   const sector = await f.request('/api/visits/departments', { method: 'POST', cookie, body: { company_id: 1, unit_id: unit.body.id, name: 'TI' } });
   assert.equal(sector.status, 201);
+  for (const contact_type of ['primary_manager', 'substitute']) {
+    assert.equal((await f.request('/api/visits/managers', { method: 'POST', cookie, body: { company_id: 1, department_id: sector.body.id, contact_type, name: 'Gestor', email: contact_type+'@example.test', job_title: 'Gestor' } })).status, 201);
+  }
   const created = await f.request('/api/visits', { method: 'POST', cookie, body: { company_id: 1, technician_id: 2, created_by_user_id: 5, unit_id: unit.body.id, department_ids: [sector.body.id] } });
   assert.equal(created.status, 201);
   assert.equal(created.body.created_by_user_id, 1);
@@ -331,10 +332,10 @@ test('admin mantém acesso operacional a chamados e atribuição interna', async
 
 test('técnico fica restrito às próprias visitas e não acessa áreas administrativas', async t => {
   const f = await fixture(t);
-  await f.exec(`INSERT INTO company_contacts(company_id,contact_type,name,email,job_title) VALUES
-    (1,'primary_manager','Gestor','gestor@example.test','Diretor'),(1,'substitute','Substituto','sub@example.test','Supervisor');
-    INSERT INTO company_units(id,company_id,name) VALUES(1,1,'Matriz');
+  await f.exec(`INSERT INTO company_units(id,company_id,name) VALUES(1,1,'Matriz');
     INSERT INTO company_departments(id,company_id,unit_id,name) VALUES(1,1,1,'TI');
+    INSERT INTO company_contacts(company_id,department_id,contact_type,name,email,job_title) VALUES
+    (1,1,'primary_manager','Gestor','gestor@example.test','Diretor'),(1,1,'substitute','Substituto','sub@example.test','Supervisor');
     INSERT INTO technical_visits(id,visit_number,company_id,technician_user_id,visit_type,status,created_by_user_id) VALUES
     (1,'VIS-OWN',1,2,'preventive','draft',1),(2,'VIS-OTHER',1,1,'preventive','draft',1);
     INSERT INTO technical_visit_departments(id,visit_id,department_id,department_name_snapshot) VALUES(1,1,1,'TI'),(2,2,1,'TI');`);

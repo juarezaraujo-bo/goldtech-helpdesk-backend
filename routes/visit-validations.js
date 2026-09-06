@@ -21,16 +21,19 @@ module.exports=function registerVisitValidationRoutes(app,db,options={}){
   const from=options.from||process.env.SMTP_FROM||'"Goldtech Helpdesk" <suporte@goldtech.com.br>';
   const ttlMs=options.tokenTtlMs||TOKEN_TTL_MS;
   app.post('/api/visits/:id/departments/:itemId/request-validation',asyncRoute(async(req,res)=>{
-    const visitId=asId(req.params.id),itemId=asId(req.params.itemId),contactType=text(req.body&&req.body.contact_type);
-    if(!visitId||!itemId||!CONTACT_TYPES.has(contactType))return res.status(400).json({error:'Informe primary_manager ou substitute.'});
+    const visitId=asId(req.params.id),itemId=asId(req.params.itemId),selectedContactId=asId(req.body&&req.body.selected_contact_id),requestedType=text(req.body&&req.body.contact_type);
+    if(!visitId||!itemId||(!selectedContactId&&!CONTACT_TYPES.has(requestedType)))return res.status(400).json({error:'Informe selected_contact_id ou um tipo de responsável válido.'});
     if(req.body.email!==undefined||req.body.responsible_email!==undefined)return res.status(400).json({error:'O e-mail deve vir do cadastro do responsável.'});
     const item=await get(db,'SELECT vd.*,v.company_id,v.visit_number,v.status AS visit_status,c.name AS company_name,d.name AS department_name,t.name AS technician_name FROM technical_visit_departments vd JOIN technical_visits v ON v.id=vd.visit_id JOIN companies c ON c.id=v.company_id JOIN company_departments d ON d.id=vd.department_id JOIN users t ON t.id=v.technician_user_id WHERE vd.id=? AND vd.visit_id=?',[itemId,visitId]);
     if(!item)return res.status(404).json({error:'Setor da visita não encontrado.'});
     if(!item.completed_at)return res.status(409).json({error:'Conclua o setor antes de solicitar validação.'});
     if(!['in_progress','awaiting_validation'].includes(item.visit_status))return res.status(409).json({error:'A visita não permite solicitação de validação neste status.'});
     if(item.validation_status==='validated')return res.status(409).json({error:'O setor já foi validado.'});
-    const contact=await get(db,'SELECT * FROM company_contacts WHERE company_id=? AND contact_type=? AND active=1',[item.company_id,contactType]);
-    if(!contact)return res.status(409).json({error:'Responsável ativo não encontrado para a empresa.'});
+    const contact=selectedContactId
+      ? await get(db,'SELECT * FROM company_contacts WHERE id=? AND company_id=? AND department_id=? AND active=1',[selectedContactId,item.company_id,item.department_id])
+      : await get(db,'SELECT * FROM company_contacts WHERE company_id=? AND department_id=? AND contact_type=? AND active=1',[item.company_id,item.department_id,requestedType]);
+    if(!contact)return res.status(409).json({error:'Responsável ativo não encontrado para este setor.'});
+    const contactType=contact.contact_type;
     const token=crypto.randomBytes(32).toString('base64url');
     const hash=tokenHash(token),hint=token.slice(-6),protocol='VAL-'+new Date().toISOString().replace(/\D/g,'').slice(0,14)+'-'+crypto.randomBytes(3).toString('hex').toUpperCase();
     const expiresAt=sqliteDate(new Date(Date.now()+ttlMs));

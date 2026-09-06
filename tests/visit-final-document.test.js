@@ -7,13 +7,14 @@ const crypto = require('crypto');
 const express = require('express');
 const sqlite3 = require('sqlite3');
 const migration = require('../migrations/001_create_visits_schema');
+const contactScopeMigration = require('../migrations/002_scope_company_contacts_by_department');
 
 async function fixture(t, blockedStorage = false, registerManual = true, externalCallback, finishManually = true) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'visit-final-auto-'));
   const db = new sqlite3.Database(':memory:');
   const exec = sql => new Promise((resolve, reject) => db.exec(sql, error => error ? reject(error) : resolve()));
   const get = (sql, params = []) => new Promise((resolve, reject) => db.get(sql, params, (error, row) => error ? reject(error) : resolve(row)));
-  await exec("PRAGMA foreign_keys=ON; CREATE TABLE companies(id INTEGER PRIMARY KEY,name TEXT); CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT,role TEXT,active INTEGER); CREATE TABLE tickets(id INTEGER PRIMARY KEY); INSERT INTO companies VALUES(1,'Cliente teste'); INSERT INTO users VALUES(1,'Técnico teste','tecnico',1);" + migration.up + "INSERT INTO company_contacts(company_id,contact_type,name,email,job_title) VALUES(1,'primary_manager','Gestor','gestor@example.test','Diretor'),(1,'substitute','Substituto','sub@example.test','Supervisor'); INSERT INTO company_departments(company_id,name) VALUES(1,'TI'),(1,'Administrativo');");
+  await exec("PRAGMA foreign_keys=ON; CREATE TABLE companies(id INTEGER PRIMARY KEY,name TEXT); CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT,role TEXT,active INTEGER); CREATE TABLE tickets(id INTEGER PRIMARY KEY); INSERT INTO companies VALUES(1,'Cliente teste'); INSERT INTO users VALUES(1,'Técnico teste','tecnico',1);" + migration.up + contactScopeMigration.up + "INSERT INTO company_departments(id,company_id,name) VALUES(1,1,'TI'),(2,1,'Administrativo'); INSERT INTO company_contacts(company_id,department_id,contact_type,name,email,job_title) VALUES(1,1,'primary_manager','Gestor','gestor@example.test','Diretor'),(1,2,'primary_manager','Maria','gestor@example.test','Diretora'),(1,2,'substitute','João','sub@example.test','Supervisor');");
   const storageRoot = path.join(directory, 'documents');
   if (blockedStorage) fs.writeFileSync(storageRoot, 'not a directory');
   const state = { messages: [], failManager: false };
@@ -51,7 +52,7 @@ async function fixture(t, blockedStorage = false, registerManual = true, externa
     tokens.push(new URL(state.messages.at(-1).text.match(/https?:\/\/\S+/)[0]).pathname.split('/').pop());
   }
   if (finishManually) await request('/api/visits/' + visit.id + '/finish', 'POST');
-  return { ...state, state, request, visit, get, storageRoot, confirm: index => request('/api/visits/public/validate/' + tokens[index], 'POST', { accepted: true, name: index ? 'Substituto' : 'Gestor' }) };
+  return { ...state, state, request, visit, get, storageRoot, confirm: index => request('/api/visits/public/validate/' + tokens[index], 'POST', { accepted: true, name: index ? 'João' : 'Gestor' }) };
 }
 
 test('última validação fecha visita iniciada antes de gerar PDF com término e duração', async t => {
@@ -85,6 +86,7 @@ test('última validação fecha visita iniciada antes de gerar PDF com término 
   assert.ok(rendered.includes(formatDate(after.started_at)));
   assert.ok(rendered.includes(formatDate(after.finished_at)));
   assert.ok(rendered.includes(duration(after.started_at, after.finished_at)));
+  assert.ok(rendered.includes('João'));
   assert.ok(!rendered.includes('Não disponível'));
   const document = await f.get('SELECT * FROM visit_documents');
   const bytes = fs.readFileSync(path.join(f.storageRoot, document.storage_path));
