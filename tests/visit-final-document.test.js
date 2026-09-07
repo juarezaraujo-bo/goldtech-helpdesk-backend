@@ -25,7 +25,7 @@ async function fixture(t, blockedStorage = false, registerManual = true, externa
     state.messages.push(mail);
   } };
   const app = express(); app.use(express.json());
-  require('../routes/visits')(app, db);
+  require('../routes/visits')(app, db, { mailer, storageRoot, archiveEmail: 'arquivo@example.test', frontendUrl: 'http://frontend.test' });
   if (registerManual) require('../routes/visit-documents')(app, db, { mailer, storageRoot, archiveEmail: 'arquivo@example.test' });
   require('../routes/visit-validations')(app, db, { mailer, storageRoot, archiveEmail: 'arquivo@example.test', frontendUrl: 'http://frontend.test', finalizeVisit: externalCallback });
   const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
@@ -49,13 +49,13 @@ async function fixture(t, blockedStorage = false, registerManual = true, externa
     const sent = await request(url + '/request-validation', 'POST', { contact_type: index ? 'substitute' : 'primary_manager' });
     assert.equal(sent.body.validation_url, undefined);
     assert.equal(sent.body.token, undefined);
-    tokens.push(new URL(state.messages.at(-1).text.match(/https?:\/\/\S+/)[0]).pathname.split('/').pop());
   }
-  if (finishManually) await request('/api/visits/' + visit.id + '/finish', 'POST');
+  await request('/api/visits/' + visit.id + '/finish', 'POST');
+  for (const message of state.messages.filter(mail => !mail.attachments)) tokens.push(new URL(message.text.match(/https?:\/\/\S+/)[0]).pathname.split('/').pop());
   return { ...state, state, request, visit, get, storageRoot, confirm: index => request('/api/visits/public/validate/' + tokens[index], 'POST', { accepted: true, name: index ? 'João' : 'Gestor' }) };
 }
 
-test('última validação fecha visita iniciada antes de gerar PDF com término e duração', async t => {
+test('finalização fecha a visita antes das validações e o PDF mantém término e duração', async t => {
   const PDFDocument = require('pdfkit');
   const { formatDate, duration } = require('../services/visit-pdf');
   const rendered = [];
@@ -66,23 +66,19 @@ test('última validação fecha visita iniciada antes de gerar PDF com término 
   });
   const f = await fixture(t, false, false, undefined, false);
   const before = await f.get('SELECT * FROM technical_visits WHERE id=?', [f.visit.id]);
-  assert.equal(before.status, 'in_progress');
+  assert.equal(before.status, 'awaiting_validation');
   assert.ok(before.started_at);
-  assert.equal(before.finished_at, null);
+  assert.ok(before.finished_at);
   await f.confirm(0);
-  assert.equal((await f.get('SELECT finished_at FROM technical_visits WHERE id=?', [f.visit.id])).finished_at, null);
+  assert.equal((await f.get('SELECT finished_at FROM technical_visits WHERE id=?', [f.visit.id])).finished_at, before.finished_at);
   assert.equal((await f.get('SELECT COUNT(*) AS n FROM visit_documents')).n, 0);
-  const serverBefore = Date.now();
   const result = await f.confirm(1);
-  const serverAfter = Date.now();
   assert.equal(result.status, 200);
   assert.equal(result.body.visit_validated, true);
   const after = await f.get('SELECT * FROM technical_visits WHERE id=?', [f.visit.id]);
   assert.equal(after.status, 'validated');
   assert.equal(after.started_at, before.started_at);
-  assert.equal(after.finished_at, after.validated_at);
-  const finished = Date.parse(after.finished_at.replace(' ', 'T') + 'Z');
-  assert.ok(finished >= Math.floor(serverBefore / 1000) * 1000 && finished <= serverAfter);
+  assert.equal(after.finished_at, before.finished_at);
   assert.ok(rendered.includes(formatDate(after.started_at)));
   assert.ok(rendered.includes(formatDate(after.finished_at)));
   assert.ok(rendered.includes(duration(after.started_at, after.finished_at)));

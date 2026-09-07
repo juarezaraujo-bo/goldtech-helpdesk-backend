@@ -35,8 +35,9 @@ async function loadVisit(db,id){
 async function audit(db,visitId,departmentId,actorUserId,eventType,metadata=null){
   await run(db,'INSERT INTO visit_audit_events(visit_id,visit_department_id,actor_user_id,event_type,metadata_json) VALUES(?,?,?,?,?)',[visitId,departmentId,actorUserId,eventType,metadata?JSON.stringify(metadata):null]);
 }
-module.exports=function registerVisitRoutes(app,db){
+module.exports=function registerVisitRoutes(app,db,options={}){
   db.run('PRAGMA foreign_keys = ON');
+  const validationBatch=require('./visit-validations').createValidationBatchService(db,options);
   app.get('/api/visits',asyncRoute(async(req,res)=>{
     const conditions=[],params=[];
     if(req.user&&req.user.role==='tecnico'){conditions.push('v.technician_user_id=?');params.push(req.user.id)}
@@ -113,12 +114,32 @@ module.exports=function registerVisitRoutes(app,db){
     if(rejectsTimestamps(req.body))return res.status(400).json({error:'Horários operacionais são definidos exclusivamente pelo servidor.'});
     const id=asId(req.params.id),visit=id&&await get(db,'SELECT * FROM technical_visits WHERE id=?',[id]);
     if(!visit)return res.status(404).json({error:'Visita não encontrada.'});
-    if(visit.status!=='in_progress')return res.status(409).json({error:'A visita não pode ser finalizada neste status.'});
+    if(!['in_progress','awaiting_validation'].includes(visit.status))return res.status(409).json({error:'A visita não pode ser finalizada neste status.'});
     const incomplete=await get(db,'SELECT COUNT(*) AS count FROM technical_visit_departments WHERE visit_id=? AND completed_at IS NULL',[id]);
     if(incomplete.count>0)return res.status(409).json({error:'Conclua todos os setores antes de finalizar a visita.'});
-    const nextStatus='awaiting_validation';
-    await transaction(db,async()=>{await run(db,'UPDATE technical_visits SET status=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?',[nextStatus,id]);await audit(db,id,null,visit.technician_user_id,'visit_finished',{status:nextStatus})});
-    return res.json(await loadVisit(db,id));
+    const items=await all(db,"SELECT vd.*,v.company_id,v.visit_number,d.name AS department_name FROM technical_visit_departments vd JOIN technical_visits v ON v.id=vd.visit_id JOIN company_departments d ON d.id=vd.department_id WHERE vd.visit_id=? AND vd.validation_required=1 AND vd.validation_status!='validated' ORDER BY vd.id",[id]);
+    const pending=[];
+    for(const item of items){
+      const active=await get(db,"SELECT status FROM visit_validation_requests WHERE visit_department_id=? AND status IN ('created','sent') ORDER BY id DESC LIMIT 1",[item.id]);
+      if(active)continue;
+      const contact=await validationBatch.resolveContact(item,item.selected_contact_id,null);
+      if(!contact)return res.status(409).json({error:'Responsável ativo não encontrado para o setor '+item.department_name+'.'});
+      pending.push({item,contact});
+    }
+    const prepared=await transaction(db,async()=>{
+      const batch=[];
+      for(const entry of pending)batch.push(await validationBatch.prepare(entry.item,entry.contact,{ip:req.ip,userAgent:req.get('user-agent')}));
+      if(visit.status==='in_progress'){
+        await run(db,"UPDATE technical_visits SET status='awaiting_validation',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",[id]);
+        await audit(db,id,null,visit.technician_user_id,'visit_finished',{status:'awaiting_validation'});
+      }
+      return batch;
+    });
+    const deliveries=[];
+    for(const request of prepared)deliveries.push(await validationBatch.send(request));
+    const result=await loadVisit(db,id);
+    result.validation_delivery={total:deliveries.length,sent:deliveries.filter(item=>item.sent).length,failed:deliveries.filter(item=>!item.sent).length};
+    return res.json(result);
   }));
 };
 module.exports.NO_DEMAND_DESCRIPTION=NO_DEMAND_DESCRIPTION;

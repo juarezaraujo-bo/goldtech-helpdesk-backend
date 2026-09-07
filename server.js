@@ -12,7 +12,8 @@ const databaseError = (res, error) => {
 app.use(express.json());
 require('./services/helpdesk-auth').installHelpdeskAuth(app, db, authOptions);
 require('./routes/visit-catalogs')(app, db);
-require('./routes/visits')(app, db);
+const visitMailer = require('./services/visit-graph-mailer').createVisitGraphMailer();
+require('./routes/visits')(app, db, { mailer: visitMailer });
 
 app.get('/', (req, res) => {
     res.json({ status: 'ok', service: 'goldtech-helpdesk-api' });
@@ -443,7 +444,6 @@ const mailer = nodemailer.createTransport({
     },
 });
 
-const visitMailer = require('./services/visit-graph-mailer').createVisitGraphMailer();
 require('./routes/visit-documents')(app, db, { mailer: visitMailer });
 require('./routes/visit-validations')(app, db, { mailer: visitMailer });
 

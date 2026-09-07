@@ -13,13 +13,46 @@ const tokenHash=token=>crypto.createHash('sha256').update(token).digest('hex');
 const publicUrl=(frontendUrl,token)=>frontendUrl.replace(/\/$/,'')+'/visitas/validar/'+encodeURIComponent(token);
 async function transaction(db,work){await exec(db,'BEGIN IMMEDIATE;');try{const result=await work();await exec(db,'COMMIT;');return result}catch(error){await exec(db,'ROLLBACK;').catch(()=>{});throw error}}
 async function audit(db,visitId,itemId,contactId,eventType,ip,userAgent,metadata=null){await run(db,'INSERT INTO visit_audit_events(visit_id,visit_department_id,actor_contact_id,event_type,ip,user_agent,metadata_json) VALUES(?,?,?,?,?,?,?)',[visitId,itemId,contactId,eventType,ip||null,userAgent||null,metadata?JSON.stringify(metadata):null])}
+function createValidationBatchService(db,options={}){
+  const mailer=options.mailer;
+  const frontendUrl=options.frontendUrl||process.env.FRONTEND_URL||'http://localhost:5173';
+  const from=options.from||process.env.SMTP_FROM||'"Goldtech Helpdesk" <suporte@goldtech.com.br>';
+  const ttlMs=options.tokenTtlMs||TOKEN_TTL_MS;
+  const resolveContact=async(item,selectedContactId,requestedType)=>selectedContactId
+    ? get(db,'SELECT * FROM company_contacts WHERE id=? AND company_id=? AND department_id=? AND active=1',[selectedContactId,item.company_id,item.department_id])
+    : get(db,'SELECT * FROM company_contacts WHERE company_id=? AND department_id=? AND contact_type=? AND active=1',[item.company_id,item.department_id,requestedType||'primary_manager']);
+  const prepare=async(item,contact,request={})=>{
+    const token=crypto.randomBytes(32).toString('base64url');
+    const hash=tokenHash(token),hint=token.slice(-6),protocol='VAL-'+new Date().toISOString().replace(/\D/g,'').slice(0,14)+'-'+crypto.randomBytes(3).toString('hex').toUpperCase();
+    const expiresAt=sqliteDate(new Date(Date.now()+ttlMs));
+    const revocable=request.revokeSent?"'created','sent','delivery_failed','expired'":"'created','delivery_failed','expired'";
+    await run(db,"UPDATE visit_validation_requests SET status='revoked' WHERE visit_department_id=? AND status IN ("+revocable+")",[item.id]);
+    const result=await run(db,"INSERT INTO visit_validation_requests(visit_department_id,contact_id,contact_type_snapshot,recipient_name,recipient_email,recipient_job_title,token_hash,token_hint,status,expires_at,protocol) VALUES(?,?,?,?,?,?,?,?, 'created',?,?)",[item.id,contact.id,contact.contact_type,contact.name,contact.email,contact.job_title,hash,hint,expiresAt,protocol]);
+    await run(db,"UPDATE technical_visit_departments SET selected_contact_id=?,validator_name_snapshot=?,validator_email_snapshot=?,validator_phone_snapshot=?,validator_job_title_snapshot=?,validation_status='pending',validation_requested_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",[contact.id,contact.name,contact.email,contact.phone,contact.job_title,item.id]);
+    await audit(db,item.visit_id,item.id,contact.id,'validation_requested',request.ip,request.userAgent,{contact_type:contact.contact_type,protocol});
+    return{id:result.lastID,item,contact,token,expiresAt,protocol};
+  };
+  const send=async prepared=>{
+    const validationUrl=publicUrl(frontendUrl,prepared.token);
+    try{
+      if(!mailer||typeof mailer.sendMail!=='function')throw new Error('Mailer não configurado');
+      await mailer.sendMail({from,to:prepared.contact.email,subject:'Validação de visita técnica - '+prepared.item.visit_number,text:'Valide o atendimento do setor '+prepared.item.department_name+' acessando: '+validationUrl,html:'<p>Olá, '+prepared.contact.name+'.</p><p>Valide o atendimento do setor <strong>'+prepared.item.department_name+'</strong>:</p><p><a href="'+validationUrl+'">Validar visita técnica</a></p>'});
+      await run(db,"UPDATE visit_validation_requests SET status='sent',sent_at=CURRENT_TIMESTAMP WHERE id=? AND status='created'",[prepared.id]);
+      return{sent:true,...prepared};
+    }catch(error){
+      await run(db,"UPDATE visit_validation_requests SET status='delivery_failed' WHERE id=? AND status='created'",[prepared.id]);
+      return{sent:false,...prepared};
+    }
+  };
+  return{resolveContact,prepare,send};
+}
 module.exports=function registerVisitValidationRoutes(app,db,options={}){
   db.run('PRAGMA foreign_keys=ON');
   const mailer=options.mailer;
   const finalizeVisit=require('../services/visit-final-document').createFinalDocumentService(db,options);
   const frontendUrl=options.frontendUrl||process.env.FRONTEND_URL||'http://localhost:5173';
   const from=options.from||process.env.SMTP_FROM||'"Goldtech Helpdesk" <suporte@goldtech.com.br>';
-  const ttlMs=options.tokenTtlMs||TOKEN_TTL_MS;
+  const validationBatch=createValidationBatchService(db,options);
   app.post('/api/visits/:id/departments/:itemId/request-validation',asyncRoute(async(req,res)=>{
     const visitId=asId(req.params.id),itemId=asId(req.params.itemId),selectedContactId=asId(req.body&&req.body.selected_contact_id),requestedType=text(req.body&&req.body.contact_type);
     if(!visitId||!itemId||(!selectedContactId&&!CONTACT_TYPES.has(requestedType)))return res.status(400).json({error:'Informe selected_contact_id ou um tipo de responsável válido.'});
@@ -29,34 +62,17 @@ module.exports=function registerVisitValidationRoutes(app,db,options={}){
     if(!item.completed_at)return res.status(409).json({error:'Conclua o setor antes de solicitar validação.'});
     if(!['in_progress','awaiting_validation'].includes(item.visit_status))return res.status(409).json({error:'A visita não permite solicitação de validação neste status.'});
     if(item.validation_status==='validated')return res.status(409).json({error:'O setor já foi validado.'});
-    const contact=selectedContactId
-      ? await get(db,'SELECT * FROM company_contacts WHERE id=? AND company_id=? AND department_id=? AND active=1',[selectedContactId,item.company_id,item.department_id])
-      : await get(db,'SELECT * FROM company_contacts WHERE company_id=? AND department_id=? AND contact_type=? AND active=1',[item.company_id,item.department_id,requestedType]);
+    const contact=await validationBatch.resolveContact(item,selectedContactId,requestedType);
     if(!contact)return res.status(409).json({error:'Responsável ativo não encontrado para este setor.'});
-    const contactType=contact.contact_type;
-    const token=crypto.randomBytes(32).toString('base64url');
-    const hash=tokenHash(token),hint=token.slice(-6),protocol='VAL-'+new Date().toISOString().replace(/\D/g,'').slice(0,14)+'-'+crypto.randomBytes(3).toString('hex').toUpperCase();
-    const expiresAt=sqliteDate(new Date(Date.now()+ttlMs));
-    const requestId=await transaction(db,async()=>{
-      await run(db,"UPDATE visit_validation_requests SET status='revoked' WHERE visit_department_id=? AND status IN ('created','sent','delivery_failed')",[itemId]);
-      const result=await run(db,"INSERT INTO visit_validation_requests(visit_department_id,contact_id,contact_type_snapshot,recipient_name,recipient_email,recipient_job_title,token_hash,token_hint,status,expires_at,protocol) VALUES(?,?,?,?,?,?,?,?, 'created',?,?)",[itemId,contact.id,contact.contact_type,contact.name,contact.email,contact.job_title,hash,hint,expiresAt,protocol]);
-      return result.lastID;
-    });
-    const validationUrl=publicUrl(frontendUrl,token);
-    try{
-      if(!mailer||typeof mailer.sendMail!=='function')throw new Error('Mailer não configurado');
-      await mailer.sendMail({from,to:contact.email,subject:'Validação de visita técnica - '+item.visit_number,text:'Valide o atendimento do setor '+item.department_name+' acessando: '+validationUrl,html:'<p>Olá, '+contact.name+'.</p><p>Valide o atendimento do setor <strong>'+item.department_name+'</strong>:</p><p><a href="'+validationUrl+'">Validar visita técnica</a></p>'});
-    }catch(error){
-      // The Graph transport logs only HTTP status and a fixed, safe message.
-      await run(db,"UPDATE visit_validation_requests SET status='delivery_failed' WHERE id=?",[requestId]);
-      return res.status(502).json({error:'Não foi possível enviar o e-mail de validação.'});
+    if(item.visit_status==='in_progress'){
+      await run(db,"UPDATE technical_visit_departments SET selected_contact_id=?,validator_name_snapshot=?,validator_email_snapshot=?,validator_phone_snapshot=?,validator_job_title_snapshot=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",[contact.id,contact.name,contact.email,contact.phone,contact.job_title,itemId]);
+      return res.json({success:true,validation_prepared:false,recipient:{name:contact.name,email:contact.email,contact_type:contact.contact_type}});
     }
-    await transaction(db,async()=>{
-      await run(db,"UPDATE visit_validation_requests SET status='sent',sent_at=CURRENT_TIMESTAMP WHERE id=?",[requestId]);
-      await run(db,"UPDATE technical_visit_departments SET selected_contact_id=?,validator_name_snapshot=?,validator_email_snapshot=?,validator_phone_snapshot=?,validator_job_title_snapshot=?,validation_status='pending',validation_requested_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",[contact.id,contact.name,contact.email,contact.phone,contact.job_title,itemId]);
-      await audit(db,visitId,itemId,contact.id,'validation_requested',req.ip,req.get('user-agent'),{contact_type:contactType,protocol});
-    });
-    return res.status(201).json({success:true,email_sent:true,recipient:{name:contact.name,email:contact.email,contact_type:contact.contact_type},expires_at:expiresAt,protocol});
+    const contactType=contact.contact_type;
+    const prepared=await transaction(db,()=>validationBatch.prepare({...item,id:itemId,visit_id:visitId},contact,{ip:req.ip,userAgent:req.get('user-agent'),revokeSent:true}));
+    const delivery=await validationBatch.send(prepared);
+    if(!delivery.sent)return res.status(502).json({error:'Não foi possível enviar o e-mail de validação.'});
+    return res.status(201).json({success:true,email_sent:true,recipient:{name:contact.name,email:contact.email,contact_type:contactType},expires_at:prepared.expiresAt,protocol:prepared.protocol});
   }));
   app.get('/api/visits/public/validate/:token',asyncRoute(async(req,res)=>{
     const hash=tokenHash(req.params.token||'');
@@ -111,3 +127,4 @@ module.exports=function registerVisitValidationRoutes(app,db,options={}){
   }));
 };
 module.exports.tokenHash=tokenHash;
+module.exports.createValidationBatchService=createValidationBatchService;
