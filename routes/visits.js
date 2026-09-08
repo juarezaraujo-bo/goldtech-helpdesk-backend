@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { createIntegratedVisit, IntegratedCreationError } = require('../services/integrated-visit-creation');
 const VISIT_TYPES = new Set(['preventive','ticket','emergency','project']);
 const DEMAND_STATUSES = new Set(['com_demanda','sem_demanda']);
 const SERVER_TIMESTAMPS = ['started_at','completed_at','finished_at','validated_at'];
@@ -49,7 +50,7 @@ module.exports=function registerVisitRoutes(app,db,options={}){
   }));
   app.post('/api/visits',asyncRoute(async(req,res)=>{
     if(rejectsTimestamps(req.body))return res.status(400).json({error:'Horários operacionais são definidos exclusivamente pelo servidor.'});
-    const companyId=asId(req.body.company_id),technicianId=req.user?.role==='tecnico'?req.user.id:asId(req.body.technician_id),createdById=req.user?.role==='tecnico'?req.user.id:(asId(req.body.created_by_user_id)||technicianId);
+    const companyId=asId(req.body.company_id),technicianId=req.user?.role==='tecnico'?req.user.id:asId(req.body.technician_id),createdById=asId(req.user?.id);
     const unitId=req.body.unit_id===undefined||req.body.unit_id===null||req.body.unit_id===''?null:asId(req.body.unit_id);
     const type=text(req.body.visit_type)||'preventive';
     const departmentIds=[...new Set(Array.isArray(req.body.department_ids)?req.body.department_ids.map(asId):[])];
@@ -62,14 +63,22 @@ module.exports=function registerVisitRoutes(app,db,options={}){
     const placeholders=departmentIds.map(()=>'?').join(',');
     const departments=await all(db,'SELECT id,name,unit_id FROM company_departments WHERE active=1 AND company_id=? AND id IN ('+placeholders+')',[companyId,...departmentIds]);
     if(departments.length!==departmentIds.length||departments.some(item=>item.unit_id!==null&&item.unit_id!==unitId))return res.status(400).json({error:'Um ou mais setores não pertencem à empresa/unidade selecionada.'});
-    const status=req.body.scheduled_at?'scheduled':'draft';
-    const id=await transaction(db,async()=>{
-      const result=await run(db,'INSERT INTO technical_visits(visit_number,company_id,unit_id,technician_user_id,visit_type,status,scheduled_at,general_notes,created_by_user_id) VALUES(?,?,?,?,?,?,?,?,?)',[visitNumber(),companyId,unitId,technicianId,type,status,text(req.body.scheduled_at),text(req.body.general_notes),createdById]);
-      for(const department of departments)await run(db,'INSERT INTO technical_visit_departments(visit_id,department_id,department_name_snapshot) VALUES(?,?,?)',[result.lastID,department.id,department.name]);
-      await audit(db,result.lastID,null,createdById,'visit_created',{department_count:departments.length});
-      return result.lastID;
-    });
-    return res.status(201).json(await loadVisit(db,id));
+    let integrated;
+    try {
+      integrated=await createIntegratedVisit(db,{
+        mode:'manual_visit',company_id:companyId,created_by_user_id:createdById,
+        ticket:{title:'Visita técnica - '+company.name,description:'Chamado criado automaticamente para atendimento de visita técnica presencial.',category:'Visita Técnica',priority:'Medium',assigned_technician_id:technicianId,origin:'technical_visit'},
+        service_order:{description:'Ordem de serviço presencial criada automaticamente para visita técnica.'},
+        visit:{unit_id:unitId,technician_user_id:technicianId,visit_type:type,department_ids:departmentIds,scheduled_at:req.body.scheduled_at,general_notes:req.body.general_notes}
+      });
+    } catch(error) {
+      if(error instanceof IntegratedCreationError)return res.status(400).json({error:error.message});
+      throw error;
+    }
+    const created=await loadVisit(db,integrated.visit.id);
+    created.ticket_number=integrated.ticket.ticket_number;
+    created.order_number=integrated.service_order.order_number;
+    return res.status(201).json(created);
   }));
   app.get('/api/visits/:id',asyncRoute(async(req,res)=>{
     const id=asId(req.params.id);if(!id)return res.status(400).json({error:'Visita inválida.'});
