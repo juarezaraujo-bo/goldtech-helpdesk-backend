@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const { createIntegratedVisit } = require('./services/integrated-visit-creation');
 
 function createApp(db, authOptions = {}) {
 const app = express();
@@ -262,57 +263,63 @@ app.get('/api/tickets/:id', (req, res) => {
 
 app.post('/api/tickets', (req, res) => {
     const { title, description, category, priority, company_id, opened_by_user_id, assigned_technician_id } = req.body;
-    
-    db.get("SELECT COUNT(*) as count FROM tickets", (err, row) => {
-        if (err) return databaseError(res, err);
-        const nextId = (row.count + 1).toString().padStart(4, '0');
-        const year = new Date().getFullYear();
-        const ticketNumber = `GT-${year}-${nextId}`;
+    const isClientTicket = !req.isIntegration && ['cliente_usuario', 'cliente_gestor'].includes(req.user && req.user.role);
 
-        const slaHoursMap = { 'Critical': 2, 'High': 4, 'Medium': 8, 'Low': 24 };
-        const slaHours = slaHoursMap[priority] || 24;
-        const slaDeadline = new Date(Date.now() + slaHours * 60 * 60 * 1000).toISOString();
+    const createTicket = autoCreateVisit => {
+        db.get("SELECT COUNT(*) as count FROM tickets", (err, row) => {
+            if (err) return databaseError(res, err);
+            const nextId = (row.count + 1).toString().padStart(4, '0');
+            const year = new Date().getFullYear();
+            const ticketNumber = `GT-${year}-${nextId}`;
+            const slaHoursMap = { 'Critical': 2, 'High': 4, 'Medium': 8, 'Low': 24 };
+            const slaHours = slaHoursMap[priority] || 24;
+            const slaDeadline = new Date(Date.now() + slaHours * 60 * 60 * 1000).toISOString();
 
-        const getAssignee = (callback) => {
-            if (assigned_technician_id) {
-                callback(assigned_technician_id, 0);
-            } else {
+            const getAssignee = callback => {
+                if (assigned_technician_id) return callback(assigned_technician_id, 0);
                 const workloadQuery = `
-                    SELECT u.id 
-                    FROM users u 
+                    SELECT u.id FROM users u
                     LEFT JOIN tickets t ON u.id = t.assigned_technician_id AND t.status IN ('Open', 'In Progress')
                     WHERE (u.role = 'tecnico' OR LOWER(u.role) = 'tecnico' OR u.role = 'TÉCNICO') AND u.active = 1
-                    GROUP BY u.id 
-                    ORDER BY COUNT(t.id) ASC 
-                    LIMIT 1
+                    GROUP BY u.id ORDER BY COUNT(t.id) ASC LIMIT 1
                 `;
-                db.get(workloadQuery, [], (err, row) => {
-                    if (row) callback(row.id, 1);
-                    else callback(null, 0);
-                });
-            }
-        };
+                db.get(workloadQuery, [], (error, technician) => technician ? callback(technician.id, 1) : callback(null, 0));
+            };
 
-        getAssignee((finalTechId, isAuto) => {
-            const status = finalTechId ? 'In Progress' : 'Open';
-            const query = `INSERT INTO tickets (company_id, opened_by_user_id, ticket_number, title, description, category, priority, sla_deadline, assigned_technician_id, status, is_auto_assigned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-            
-            db.run(query, [company_id, opened_by_user_id, ticketNumber, title, description, category, priority, slaDeadline, finalTechId, status, isAuto], function(err) {
-                if (err) return databaseError(res, err);
-                const ticketId = this.lastID;
-                
-                // Notifications
-                notifyAdmins(ticketId, 'new_ticket', `Novo chamado criado: ${ticketNumber}`);
-                if (finalTechId) {
-                    createNotification(finalTechId, ticketId, 'assigned', `Você foi designado para o chamado ${ticketNumber}`);
+            getAssignee((finalTechId, isAuto) => {
+                if (autoCreateVisit) {
+                    createIntegratedVisit(db, {
+                        mode: 'ticket_automation', company_id: req.user.company_id, created_by_user_id: req.user.id,
+                        ticket: { title, description, category, priority, sla_deadline: slaDeadline, assigned_technician_id: finalTechId, is_auto_assigned: isAuto, origin: 'web' },
+                        service_order: { description: 'Ordem de serviço presencial criada automaticamente a partir do chamado.' },
+                        visit: { technician_user_id: finalTechId, visit_type: 'ticket' }
+                    }).then(result => {
+                        notifyAdmins(result.ticket.id, 'new_ticket', `Novo chamado criado: ${result.ticket.ticket_number}`);
+                        if (finalTechId) createNotification(finalTechId, result.ticket.id, 'assigned', `Você foi designado para o chamado ${result.ticket.ticket_number}`);
+                        res.status(201).json({ id: result.ticket.id, ticket_number: result.ticket.ticket_number, sla_deadline: slaDeadline, assigned_technician_id: finalTechId, is_auto_assigned: isAuto, service_order_id: result.service_order.id, visit_id: result.visit.id, order_number: result.service_order.order_number });
+                    }).catch(error => databaseError(res, error));
+                    return;
                 }
 
-                res.status(201).json({ id: ticketId, ticket_number: ticketNumber, sla_deadline: slaDeadline, assigned_technician_id: finalTechId, is_auto_assigned: isAuto });
+                const status = finalTechId ? 'In Progress' : 'Open';
+                const query = `INSERT INTO tickets (company_id, opened_by_user_id, ticket_number, title, description, category, priority, sla_deadline, assigned_technician_id, status, is_auto_assigned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+                db.run(query, [company_id, opened_by_user_id, ticketNumber, title, description, category, priority, slaDeadline, finalTechId, status, isAuto], function(err) {
+                    if (err) return databaseError(res, err);
+                    const ticketId = this.lastID;
+                    notifyAdmins(ticketId, 'new_ticket', `Novo chamado criado: ${ticketNumber}`);
+                    if (finalTechId) createNotification(finalTechId, ticketId, 'assigned', `Você foi designado para o chamado ${ticketNumber}`);
+                    res.status(201).json({ id: ticketId, ticket_number: ticketNumber, sla_deadline: slaDeadline, assigned_technician_id: finalTechId, is_auto_assigned: isAuto });
+                });
             });
         });
+    };
+
+    if (!isClientTicket) return createTicket(false);
+    db.get('SELECT auto_create_visit_from_ticket FROM companies WHERE id=?', [req.user.company_id], (err, company) => {
+        if (err) return databaseError(res, err);
+        return createTicket(company && company.auto_create_visit_from_ticket === 1);
     });
 });
-
 app.put('/api/tickets/:id', (req, res) => {
     const { status, priority, assigned_technician_id } = req.body;
     

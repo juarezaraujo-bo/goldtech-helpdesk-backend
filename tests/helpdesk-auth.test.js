@@ -10,6 +10,7 @@ const sqlite3 = require('sqlite3');
 const { createApp } = require('../server');
 const migration = require('../migrations/001_create_visits_schema');
 const contactScopeMigration = require('../migrations/002_scope_company_contacts_by_department');
+const architectureMigration = require('../migrations/003_add_service_orders_and_ticket_visit_documents');
 const { verifyPassword } = require('../services/helpdesk-auth');
 
 async function fixture(t, production = false, envOverrides = {}) {
@@ -19,7 +20,7 @@ async function fixture(t, production = false, envOverrides = {}) {
   await exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE companies(id INTEGER PRIMARY KEY,name TEXT,trade_name TEXT,cnpj TEXT,contact_name TEXT,contact_email TEXT,phone TEXT,status TEXT);
     CREATE TABLE users(id INTEGER PRIMARY KEY,company_id INTEGER,name TEXT,email TEXT,username TEXT UNIQUE,password_hash TEXT,role TEXT,active INTEGER DEFAULT 1,department TEXT,updated_at TEXT,reset_token TEXT,reset_token_expires TEXT);
-    CREATE TABLE tickets(id INTEGER PRIMARY KEY,company_id INTEGER,opened_by_user_id INTEGER,ticket_number TEXT,title TEXT,description TEXT,category TEXT,priority TEXT,sla_deadline TEXT,assigned_technician_id INTEGER,status TEXT,is_auto_assigned INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT,closed_at TEXT);
+    CREATE TABLE tickets(id INTEGER PRIMARY KEY,company_id INTEGER,opened_by_user_id INTEGER,ticket_number TEXT,title TEXT,description TEXT,category TEXT,priority TEXT,sla_deadline TEXT,assigned_technician_id INTEGER,status TEXT,is_auto_assigned INTEGER,origin TEXT DEFAULT 'web',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT,closed_at TEXT);
     CREATE TABLE ticket_interactions(id INTEGER PRIMARY KEY,ticket_id INTEGER,user_id INTEGER,message TEXT,interaction_type TEXT,visible_to_client INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE notifications(id INTEGER PRIMARY KEY,user_id INTEGER,ticket_id INTEGER,type TEXT,message TEXT,read INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
     INSERT INTO companies(id,name) VALUES(1,'Cliente'),(2,'Outra empresa');
@@ -29,7 +30,7 @@ async function fixture(t, production = false, envOverrides = {}) {
       (3,1,'Cliente','client@example.test','client','legacy-pass','cliente_usuario'),
       (4,1,'Gestor','manager@example.test','manager','legacy-pass','cliente_gestor'),
       (5,2,'Outro','other@example.test','other','legacy-pass','cliente_usuario');
-  ` + migration.up + contactScopeMigration.up);
+  ` + migration.up + contactScopeMigration.up + architectureMigration.up);
   let current = Date.now();
   const env = { NODE_ENV: production ? 'production' : 'test', FRONTEND_URL: production ? 'https://helpdesk.example.test' : 'http://localhost:5173', SESSION_TTL_MS: '1000' };
   Object.assign(env, envOverrides);
@@ -470,4 +471,54 @@ test('inicialização em produção não cria seeds mesmo com ENABLE_DEV_SEED=tr
   const script = `const db=require('./database');setTimeout(()=>db.all('SELECT username FROM users',(error,rows)=>{if(error)throw error;console.log('SEED_RESULT:'+JSON.stringify(rows));db.close()}),1400);`;
   const { stdout } = await promisify(execFile)(process.execPath, ['-e', script], { cwd: path.join(__dirname, '..'), env: { ...process.env, NODE_ENV: 'production', ENABLE_DEV_SEED: 'true', DB_PATH: dbPath } });
   assert.match(stdout, /SEED_RESULT:\[\]/);
+});
+
+test('cliente com automação desligada mantém resposta e cria somente chamado', async t => {
+  const f = await fixture(t); const { cookie } = await f.login('client');
+  const result = await f.request('/api/tickets', { cookie, method: 'POST', body: { title: 'Chamado normal', description: 'Descrição', priority: 'Low' } });
+  assert.equal(result.status, 201);
+  assert.ok(result.body.id); assert.ok(result.body.ticket_number); assert.ok(result.body.sla_deadline);
+  assert.equal(result.body.service_order_id, undefined); assert.equal(result.body.visit_id, undefined);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM tickets')).count, 1);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM service_orders')).count, 0);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM technical_visits')).count, 0);
+});
+
+test('cliente com automação ligada cria chamado, O.S. onsite e visita draft vinculados', async t => {
+  const f = await fixture(t); await f.exec('UPDATE companies SET auto_create_visit_from_ticket=1 WHERE id=1');
+  const { cookie } = await f.login('client');
+  const result = await f.request('/api/tickets', { cookie, method: 'POST', body: { title: 'Atendimento presencial', description: 'Solicitação do cliente', priority: 'Medium' } });
+  assert.equal(result.status, 201); assert.ok(result.body.service_order_id); assert.ok(result.body.visit_id); assert.match(result.body.order_number, /^OS-/);
+  const linked = await f.get(`SELECT t.company_id,so.ticket_id,so.service_mode,v.ticket_id AS visit_ticket_id,v.service_order_id,v.status,v.visit_type
+    FROM tickets t JOIN service_orders so ON so.ticket_id=t.id JOIN technical_visits v ON v.service_order_id=so.id WHERE t.id=?`, [result.body.id]);
+  assert.equal(linked.company_id, 1); assert.equal(linked.ticket_id, result.body.id); assert.equal(linked.visit_ticket_id, result.body.id);
+  assert.equal(linked.service_order_id, result.body.service_order_id); assert.equal(linked.service_mode, 'onsite'); assert.equal(linked.status, 'draft'); assert.equal(linked.visit_type, 'ticket');
+});
+
+test('automação cria visita sem técnico quando nenhum técnico está disponível', async t => {
+  const f = await fixture(t); await f.exec("UPDATE companies SET auto_create_visit_from_ticket=1 WHERE id=1; UPDATE users SET active=0 WHERE role='tecnico';");
+  const { cookie } = await f.login('client');
+  const result = await f.request('/api/tickets', { cookie, method: 'POST', body: { title: 'Sem técnico disponível' } });
+  assert.equal(result.status, 201); assert.equal(result.body.assigned_technician_id, null);
+  const visit = await f.get('SELECT technician_user_id,status FROM technical_visits WHERE id=?', [result.body.visit_id]);
+  assert.deepEqual(visit, { technician_user_id: null, status: 'draft' });
+});
+
+test('falha na visita automática desfaz chamado e O.S. integralmente', async t => {
+  const f = await fixture(t); await f.exec("UPDATE companies SET auto_create_visit_from_ticket=1 WHERE id=1; CREATE TRIGGER fail_auto_visit BEFORE INSERT ON technical_visits BEGIN SELECT RAISE(ABORT,'forced visit failure'); END;");
+  const { cookie } = await f.login('client');
+  const result = await f.request('/api/tickets', { cookie, method: 'POST', body: { title: 'Falha transacional' } });
+  assert.equal(result.status, 500);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM tickets')).count, 0);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM service_orders')).count, 0);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM technical_visits')).count, 0);
+});
+
+test('configuração de uma empresa não automatiza chamado de outra empresa', async t => {
+  const f = await fixture(t); await f.exec('UPDATE companies SET auto_create_visit_from_ticket=1 WHERE id=1');
+  const { cookie } = await f.login('other');
+  const result = await f.request('/api/tickets', { cookie, method: 'POST', body: { title: 'Outra empresa' } });
+  assert.equal(result.status, 201); assert.equal((await f.get('SELECT company_id FROM tickets WHERE id=?', [result.body.id])).company_id, 2);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM service_orders')).count, 0);
+  assert.equal((await f.get('SELECT COUNT(*) AS count FROM technical_visits')).count, 0);
 });
