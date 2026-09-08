@@ -19,6 +19,10 @@ test('fluxo público sem sessão expõe detalhes e confirma somente com aceite e
   await request('POST','/api/visits/'+id+'/finish');
   const sent=await request('POST','/api/visits/'+id+'/departments/'+item.id+'/request-validation',{selected_contact_id:1});
   const url='/api/visits/public/validate/'+tokenFrom(sent);
+  await exec("UPDATE technical_visits SET status='cancelled' WHERE id="+id);
+  assert.equal((await request('GET',url)).status,409);
+  assert.equal((await request('POST',url,{accepted:true,name:'Gestor'})).status,409);
+  await exec("UPDATE technical_visits SET status='awaiting_validation' WHERE id="+id);
   const detail=await request('GET',url);
   assert.equal(detail.status,200);
   for(const key of ['visit_created_at','visit_started_at','visit_finished_at','started_at','completed_at'])assert.ok(detail.body[key]);

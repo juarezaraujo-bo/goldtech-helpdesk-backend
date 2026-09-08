@@ -76,8 +76,9 @@ module.exports=function registerVisitValidationRoutes(app,db,options={}){
   }));
   app.get('/api/visits/public/validate/:token',asyncRoute(async(req,res)=>{
     const hash=tokenHash(req.params.token||'');
-    const row=await get(db,"SELECT vr.id AS request_id,vr.status AS request_status,vr.expires_at,vr.recipient_name AS responsible_name,vd.id AS visit_department_id,vd.validation_status,v.visit_number,c.name AS company_name,d.name AS department_name,t.name AS technician_name,vd.demand_status,vd.activities,vd.standardized_description,vd.notes FROM visit_validation_requests vr JOIN technical_visit_departments vd ON vd.id=vr.visit_department_id JOIN technical_visits v ON v.id=vd.visit_id JOIN companies c ON c.id=v.company_id JOIN company_departments d ON d.id=vd.department_id JOIN users t ON t.id=v.technician_user_id WHERE vr.token_hash=?",[hash]);
+    const row=await get(db,"SELECT vr.id AS request_id,vr.status AS request_status,vr.expires_at,vr.recipient_name AS responsible_name,vd.id AS visit_department_id,vd.validation_status,v.visit_number,v.status AS visit_status,c.name AS company_name,d.name AS department_name,t.name AS technician_name,vd.demand_status,vd.activities,vd.standardized_description,vd.notes FROM visit_validation_requests vr JOIN technical_visit_departments vd ON vd.id=vr.visit_department_id JOIN technical_visits v ON v.id=vd.visit_id JOIN companies c ON c.id=v.company_id JOIN company_departments d ON d.id=vd.department_id JOIN users t ON t.id=v.technician_user_id WHERE vr.token_hash=?",[hash]);
     if(!row)return res.status(404).json({error:'Link de validação inválido.'});
+    if(row.visit_status==='cancelled')return res.status(409).json({error:'Esta visita foi cancelada.'});
     if(row.request_status==='validated'||row.validation_status==='validated')return res.status(409).json({error:'Este link já foi utilizado.'});
     if(row.request_status!=='sent')return res.status(410).json({error:'Este link não está mais disponível.'});
     if(new Date(row.expires_at.replace(' ','T')+'Z')<=new Date()){
@@ -94,8 +95,9 @@ module.exports=function registerVisitValidationRoutes(app,db,options={}){
     if(!name)return res.status(400).json({error:'Informe o nome de quem está validando.'});
     const hash=tokenHash(req.params.token||''),ip=req.ip,userAgent=req.get('user-agent')||null;
     const outcome=await transaction(db,async()=>{
-      const row=await get(db,"SELECT vr.*,vd.visit_id,vd.validation_status FROM visit_validation_requests vr JOIN technical_visit_departments vd ON vd.id=vr.visit_department_id WHERE vr.token_hash=?",[hash]);
+      const row=await get(db,"SELECT vr.*,vd.visit_id,vd.validation_status,v.status AS visit_status FROM visit_validation_requests vr JOIN technical_visit_departments vd ON vd.id=vr.visit_department_id JOIN technical_visits v ON v.id=vd.visit_id WHERE vr.token_hash=?",[hash]);
       if(!row)return{status:404,error:'Link de validação inválido.'};
+      if(row.visit_status==='cancelled')return{status:409,error:'Esta visita foi cancelada.'};
       if(row.status==='validated'||row.validation_status==='validated')return{status:409,error:'Este link já foi utilizado.'};
       if(row.status!=='sent')return{status:410,error:'Este link não está mais disponível.'};
       if(new Date(row.expires_at.replace(' ','T')+'Z')<=new Date()){await run(db,"UPDATE visit_validation_requests SET status='expired' WHERE id=?",[row.id]);await run(db,"UPDATE technical_visit_departments SET validation_status='expired',updated_at=CURRENT_TIMESTAMP WHERE id=? AND validation_status='pending'",[row.visit_department_id]);return{status:410,error:'Este link expirou.'}}

@@ -85,6 +85,22 @@ module.exports=function registerVisitRoutes(app,db,options={}){
     await transaction(db,async()=>{await run(db,"UPDATE technical_visits SET status='in_progress',started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",[id]);await audit(db,id,null,visit.technician_user_id,'visit_started')});
     return res.json(await loadVisit(db,id));
   }));
+  app.post('/api/visits/:id/cancel',asyncRoute(async(req,res)=>{
+    const id=asId(req.params.id),reason=text(req.body&&req.body.reason);
+    if(!id)return res.status(400).json({error:'Visita inválida.'});
+    if(!reason)return res.status(400).json({error:'Informe o motivo do cancelamento.'});
+    if(!req.user)return res.status(401).json({error:'Sessão inválida.'});
+    const visit=await get(db,'SELECT * FROM technical_visits WHERE id=?',[id]);
+    if(!visit)return res.status(404).json({error:'Visita não encontrada.'});
+    if(!['draft','scheduled','in_progress'].includes(visit.status))return res.status(409).json({error:'A visita não pode ser cancelada neste status.'});
+    const admin=req.user.role==='admin_goldtech';
+    if(!admin&&(req.user.role!=='tecnico'||visit.technician_user_id!==req.user.id))return res.status(403).json({error:'Permissão insuficiente para cancelar esta visita.'});
+    await transaction(db,async()=>{
+      await run(db,"UPDATE technical_visits SET status='cancelled',cancelled_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",[id]);
+      await audit(db,id,null,req.user.id,'visit_cancelled',{reason});
+    });
+    return res.json(await loadVisit(db,id));
+  }));
   app.put('/api/visits/:id/departments/:departmentId',asyncRoute(async(req,res)=>{
     if(rejectsTimestamps(req.body))return res.status(400).json({error:'Horários operacionais são definidos exclusivamente pelo servidor.'});
     const visitId=asId(req.params.id),itemId=asId(req.params.departmentId);
